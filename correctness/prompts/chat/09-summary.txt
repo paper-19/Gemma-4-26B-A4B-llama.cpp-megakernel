@@ -1,0 +1,5 @@
+<|turn>user
+Summarize in two sentences: GPUs hide memory latency by running many threads at once. When one group of threads waits for data from memory, the scheduler switches to another group that is ready to compute. This works well when there is a lot of independent work, as in large matrix multiplications, but a single-token decode step of a language model reads each weight once and does little arithmetic per byte, so its speed is set by memory bandwidth and by how many small kernels it launches.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

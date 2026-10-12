@@ -1,0 +1,5 @@
+<|turn>user
+Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring and a short example.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

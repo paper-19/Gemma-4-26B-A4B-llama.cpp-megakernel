@@ -1,0 +1,5 @@
+<|turn>user
+Traduis en français, puis explique un choix de traduction : "The weather is lovely today, let's go for a walk by the river before dinner."<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

@@ -1,0 +1,2421 @@
+diff --git a/ggml/include/ggml-megakernel.h b/ggml/include/ggml-megakernel.h
+new file mode 100644
+index 0000000..3670ed7
+--- /dev/null
++++ b/ggml/include/ggml-megakernel.h
+@@ -0,0 +1,86 @@
++#pragma once
++
++// Gemma 4 26B A4B decode megakernel (fork: GGML_CUDA_MEGAKERNEL=1).
++//
++// llama.cpp builds, for a single-token decode step, one GGML_OP_CUSTOM node whose userdata points to a
++// ggml_megakernel_desc (model weights, KV cache tensors, constants) and whose sources are the step's inputs:
++//   src[0] token ids (I32 [1])          src[1] positions (I32 [1])
++//   src[2] full-attention KQ mask (F16 [n_kv_full, >=1])   src[3] sliding-window KQ mask (F16 [n_kv_swa, >=1])
++//   src[4] full-attention destination cell (I64 [1])       src[5] sliding-window destination cell (I64 [1])
++//   src[6], src[7] the value-cache cells (unused; keep the inputs allocated)   src[8] output_norm (a GPU weight, for placement)
++// and whose result is the logits (F32 [n_vocab, 1], after the final logit softcapping). The CUDA backend recognises
++// the node by the descriptor's magic and runs the whole step as one persistent kernel; no other backend runs it.
++
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define GGML_MEGAKERNEL_MAGIC   0x314b4d3441344747ULL   // "GG4A4MK1"
++#define GGML_MEGAKERNEL_LAYERS  30
++
++struct ggml_megakernel_layer {
++    // norms (F32 [n_embd] unless noted)
++    const struct ggml_tensor * attn_norm, * attn_q_norm, * attn_k_norm, * attn_post_norm;   // q/k norm: [head_dim]
++    const struct ggml_tensor * ffn_norm, * ffn_post_norm_1, * ffn_pre_norm_2, * ffn_post_norm_2, * ffn_post_norm;
++    const struct ggml_tensor * out_scale;        // F32 [1]
++    const struct ggml_tensor * rope_freqs;       // F32 [head_dim / 2], full-attention layers only (else NULL)
++    // projections (quantized)
++    const struct ggml_tensor * wq, * wk, * wv;   // wv NULL on full-attention layers (V = K before its norm)
++    const struct ggml_tensor * wo;
++    const struct ggml_tensor * ffn_gate, * ffn_up, * ffn_down;
++    // MoE
++    const struct ggml_tensor * ffn_gate_inp;     // router, F32 [n_embd, n_expert]
++    const struct ggml_tensor * ffn_gate_inp_s;   // router input scale, F32 [n_embd]
++    const struct ggml_tensor * ffn_gate_up_exps; // [n_embd, 2 * n_ff_exp, n_expert]
++    const struct ggml_tensor * ffn_down_exps;    // [n_ff_exp, n_embd, n_expert]
++    const struct ggml_tensor * ffn_down_exps_s;  // F32 [n_expert]
++    // KV cache of this layer (F16 [n_embd_k_gqa, kv_size], one row per cell)
++    const struct ggml_tensor * k_cache, * v_cache;
++    int32_t swa;                                 // 1: sliding-window layer (uses src[3] / src[5])
++    int32_t head_dim, n_head_kv;
++};
++
++struct ggml_megakernel_desc {
++    uint64_t magic;                              // GGML_MEGAKERNEL_MAGIC
++    int32_t  n_layer, n_embd, n_head, n_vocab;
++    float    eps, rope_base_full, rope_base_swa, softcap, embd_scale;
++    const struct ggml_tensor * tok_embd;         // Q6_K [n_embd, n_vocab]
++    const struct ggml_tensor * output_norm;      // F32 [n_embd]
++    const struct ggml_tensor * output;           // LM head (the tied tok_embd for these files)
++    struct ggml_megakernel_layer layers[GGML_MEGAKERNEL_LAYERS];
++};
++
++// The custom op's CPU function (defined by llama.cpp's Gemma 4 builder) is never meant to run: the CUDA backend
++// claims the node (it checks the userdata's magic); it aborts with a message.
++
++// Debug hooks (checking the kernel against stock op by op; a test tool can find these with dlsym).
++// While set, every decode step runs the kernel's debug variant: it records each watch point (llama.cpp's tensor
++// names: Qcur, Qcur_normed, Qcur_pos, Kcur_pos, Vcur_normed, kqv_out, attn_out, ffn_moe_logits, ffn_moe_topk,
++// ffn_mlp, ffn_moe, l_out per layer, then result_norm), replaces the ones selected with supplied values before any
++// consumer reads them, and can plant a fault (fault-injection tests). Buffers are host memory in one layout: per layer
++// `slot` floats, watch point w at offset_w, in ggml's element order; result_norm after the last layer.
++#define GGML_MEGAKERNEL_WATCH_N 12   // per-layer watch points; index GGML_MEGAKERNEL_WATCH_N is result_norm
++
++struct ggml_megakernel_debug {
++    float       * rec;                   // filled after each step (the step synchronizes); ffn_moe_topk as int32
++    const float * rep;                   // replacement values, read before each step
++    uint32_t      rep_mask[GGML_MEGAKERNEL_LAYERS];   // per layer, bit w: replace watch point w (not ffn_moe_topk)
++    int32_t       inj_w, inj_layer;      // planted fault (inj_w < 0: none): v = v * (1 + inj_scale) + inj_rel * rms(v) * noise[i],
++    float         inj_scale, inj_rel;    // rms over the vector, or per head for Q / K / V; kqv_out: scale only
++    const float * noise;                 // unit Gaussian values for the injected watch point
++};
++
++// watch point w (0 .. GGML_MEGAKERNEL_WATCH_N) of layer `layer`: its name (without the layer suffix), its float offset in
++// the buffers and its shape; returns the buffers' total size in floats, or 0 for an invalid w / layer
++GGML_BACKEND_API size_t ggml_megakernel_debug_watch(int w, int layer, const char ** name, size_t * offset, int64_t * ne0, int64_t * ne1);
++// d: the hooks for the following steps (copied; its buffers must stay valid), or NULL to switch them off
++GGML_BACKEND_API void ggml_megakernel_debug_set(const struct ggml_megakernel_debug * d);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 957908f..7f3e52a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2,6 +2,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
++#include "ggml-cuda/megakernel.cuh"
+ #include "ggml-cuda/allreduce.cuh"
+ #include "ggml-cuda/common.cuh"
+ #include "ggml-cuda/acc.cuh"
+@@ -2498,6 +2499,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_LIGHTNING_INDEXER:
+             ggml_cuda_lightning_indexer(ctx, dst);
+             break;
++        case GGML_OP_CUSTOM:
++            if (!ggml_cuda_megakernel_is_node(dst)) {
++                return false;
++            }
++            ggml_cuda_megakernel(ctx, dst);   // the whole Gemma 4 decode step (GGML_CUDA_MEGAKERNEL=1)
++            break;
+         default:
+             return false;
+     }
+@@ -2653,6 +2660,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+             continue;
+         }
+ 
++        // the decode megakernel is one cooperative launch per graph: nothing to gain from capturing it
++        if (ggml_cuda_megakernel_is_node(node)) {
++            use_cuda_graph = false;
++        }
++
+         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+         if (node->op == GGML_OP_MUL_MAT_ID) {
+             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+@@ -5833,6 +5845,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return true;
+         case GGML_OP_LIGHTNING_INDEXER:
+             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
++        case GGML_OP_CUSTOM:
++            return ggml_cuda_megakernel_supported(op);
+ 
+         default:
+             return false;
+diff --git a/ggml/src/ggml-cuda/megakernel-common.cuh b/ggml/src/ggml-cuda/megakernel-common.cuh
+new file mode 100644
+index 0000000..660fe76
+--- /dev/null
++++ b/ggml/src/ggml-cuda/megakernel-common.cuh
+@@ -0,0 +1,91 @@
++// Shared by the megakernel op (megakernel.cu) and the persistent kernel (megakernel-persistent.cuh): model constants,
++// block layouts, warp / block helpers and the weight repacking kernels.
++#pragma once
++#include <cuda_fp16.h>
++#include <cstdint>
++
++static const int D = 2816, NL = 30, NH = 16, NE = 128, NEU = 8, FF = 2112, FFE = 704;
++static bool is_full(int L) { return L % 6 == 5; }
++
++// ---------------------------------------------------------------- device side
++struct BlockQ4 { __half d; uint8_t qs[16]; };            // 18 bytes, as in GGUF
++struct BlockQ8 { float d; float s; int sumq; int8_t q[32]; };  // s: float sum of the unquantized values
++
++__device__ __forceinline__ float warp_sum(float v) {
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
++    return v;
++}
++__device__ __forceinline__ int warp_sum_i(int v) {
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
++    return v;
++}
++__device__ __forceinline__ float warp_max(float v) {
++    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, o));
++    return v;
++}
++// block-wide sum for blockDim.x <= 1024; red has >= 32 floats
++__device__ float block_sum(float v, float *red) {
++    int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
++    v = warp_sum(v);
++    __syncthreads();
++    if (lane == 0) red[w] = v;
++    __syncthreads();
++    v = threadIdx.x < nw ? red[threadIdx.x] : 0.f;
++    if (w == 0) v = warp_sum(v);
++    if (threadIdx.x == 0) red[0] = v;
++    __syncthreads();
++    return red[0];
++}
++
++__device__ __forceinline__ float gelu_tanh(float x) {
++    return 0.5f * x * (1.f + tanhf(0.7978845608028654f * x * (1.f + 0.044715f * x * x)));
++}
++
++// GGUF Q8_0 (34 bytes) / Q5_0 (22 bytes) -> aligned quants (+ Q5_0's high bits) + float16 scales, same block order
++__global__ void k_repack_q8_0(const uint8_t *in, uint4 *qs, __half *d, size_t nblocks) {
++    size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (b >= nblocks) return;
++    const uint8_t *blk = in + b * 34;
++    const uint16_t *q16 = (const uint16_t *)(blk + 2);
++    uint32_t w[8];
++    for (int i = 0; i < 8; i++) w[i] = (uint32_t)q16[2 * i] | ((uint32_t)q16[2 * i + 1] << 16);
++    qs[2 * b] = make_uint4(w[0], w[1], w[2], w[3]); qs[2 * b + 1] = make_uint4(w[4], w[5], w[6], w[7]);
++    d[b] = *(const __half *)blk;
++}
++__global__ void k_repack_q5_0(const uint8_t *in, uint4 *qs, uint32_t *qh, __half *d, size_t nblocks) {
++    size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (b >= nblocks) return;
++    const uint8_t *blk = in + b * 22;
++    const uint16_t *h16 = (const uint16_t *)(blk + 2), *q16 = (const uint16_t *)(blk + 6);
++    uint32_t w[4];
++    for (int i = 0; i < 4; i++) w[i] = (uint32_t)q16[2 * i] | ((uint32_t)q16[2 * i + 1] << 16);
++    qs[b] = make_uint4(w[0], w[1], w[2], w[3]);
++    qh[b] = (uint32_t)h16[0] | ((uint32_t)h16[1] << 16);
++    d[b] = *(const __half *)blk;
++}
++// GGUF Q6_K blocks (210 bytes: ql[128] qh[64] scales[16] d) -> ql as 8 uint4, qh as 4 uint4, scales as 2 uint2
++// (8 per 128-value half), d, per block
++__global__ void k_repack_q6_k(const uint8_t *in, uint4 *ql, uint4 *qh, uint2 *sc, __half *d, size_t nblocks) {
++    size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (b >= nblocks) return;
++    const uint8_t *blk = in + b * 210;
++    const uint16_t *h = (const uint16_t *)blk;
++    uint32_t w[52];
++    for (int i = 0; i < 52; i++) w[i] = (uint32_t)h[2 * i] | ((uint32_t)h[2 * i + 1] << 16);   // bytes 0..207
++    for (int i = 0; i < 8; i++) ql[b * 8 + i] = make_uint4(w[4 * i], w[4 * i + 1], w[4 * i + 2], w[4 * i + 3]);
++    for (int i = 0; i < 4; i++) qh[b * 4 + i] = make_uint4(w[32 + 4 * i], w[33 + 4 * i], w[34 + 4 * i], w[35 + 4 * i]);
++    sc[b * 2] = make_uint2(w[48], w[49]); sc[b * 2 + 1] = make_uint2(w[50], w[51]);
++    d[b] = *(const __half *)(blk + 208);
++}
++// GGUF Q4_0 blocks (18 bytes) -> 16-byte-aligned quants + float16 scales, same block order
++__global__ void k_repack_q4_0(const BlockQ4 *in, uint4 *qs, __half *d, size_t nblocks) {
++    size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (b >= nblocks) return;
++    const uint16_t *q16 = (const uint16_t *)in[b].qs;
++    uint32_t w[4];
++    for (int i = 0; i < 4; i++) w[i] = (uint32_t)q16[2 * i] | ((uint32_t)q16[2 * i + 1] << 16);
++    qs[b] = make_uint4(w[0], w[1], w[2], w[3]);
++    d[b] = in[b].d;
++}
++
++// ---------------------------------------------------------------- host side
+diff --git a/ggml/src/ggml-cuda/megakernel-persistent.cuh b/ggml/src/ggml-cuda/megakernel-persistent.cuh
+new file mode 100644
+index 0000000..f6efc1f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/megakernel-persistent.cuh
+@@ -0,0 +1,1639 @@
++// The Gemma 4 26B A4B decode megakernel: one persistent, cooperatively launched kernel per decode step. Included by
++// ggml/src/ggml-cuda/megakernel.cu after megakernel-common.cuh (BlockQ4, BlockQ8, warp_sum, warp_max, block_sum,
++// gelu_tanh, repack kernels).
++//
++// Beyond the layer loop: llama.cpp's KV layout read in place (kv_ext: cells, F16 mask, destination cell), the embedding and
++// the logits with softcap in the kernel, RoPE tables in the kernel, a device-side launch epoch, the debug hooks
++// (step<true>; step<false> is the release kernel), and for long contexts launch_layers(): the full-attention layers'
++// attention in attn_mma_kernel (tensor cores) + tc_merge_kernel, or in attn_kernel.
++//
++// Work in the persistent step is split into units (half rows of Q/K/V, whole rows of Wo, eighth rows of the
++// router, half rows of gate/up, the 8 experts' down rows summed per row) assigned statically to warps; consumers add
++// parts in a fixed order, so the result is deterministic. Prologues load all their inputs at once, quantize with 8
++// lanes per 32-value group; the attention merge writes the quantized attention output directly. An LM head with a
++// device argmax can follow the last layer.
++#pragma once
++
++namespace pk {
++
++#ifndef PK_THREADS
++#define PK_THREADS 1024
++#endif
++#ifndef PK_ATT_PRELOAD
++#define PK_ATT_PRELOAD 0   // 1: in-kernel attention issues a position's K loads before its mask check (experiment; off)
++#endif
++constexpr int THREADS = PK_THREADS, WARPS = THREADS / 32;
++constexpr int AW = WARPS < 24 ? WARPS : 24;       // warps that work on an attention task (scratch: AW x (d + 2))
++constexpr int MAXD = 512;
++constexpr int E = (D + THREADS - 1) / THREADS;   // elements of a D-vector per thread (6)
++// floats of the vec scratch: three D-vectors, and big enough (with the qa region after it) for attention's
++// AW x (d + 2) warp partials + q + the new K/V row
++constexpr int ATT_SCRATCH = AW * (512 + 2) + 2 * 512;
++constexpr int QA_FLOATS = 256 * 44 / 4;            // the qa region (256 BlockQ8 of 44 bytes) follows vec
++constexpr int VEC = 3 * D > ATT_SCRATCH - QA_FLOATS ? 3 * D : ATT_SCRATCH - QA_FLOATS;
++// partial-unit counts
++constexpr int QKV_PARTS = 2, WO_PARTS = 8, R_PARTS = 8, GU_PARTS = 2;   // WO_PARTS: the most; p.wo_parts is used
++constexpr int QKV_MAX = 9216;                      // q + k (+ v) rows: 8192 sliding, 9216 full
++
++// A Q4_0 matrix: either GGUF's 18-byte blocks (aos) or repacked (soa: 16-byte-aligned quants + float16 scales,
++// same block order). Blocks are addressed by index: row r, block b of an expert e at (e * rows + r) * nb + b.
++// Weight formats: the QAT file is all Q4_0; the Q4_K_M file mixes Q4_K, Q5_K, Q6_K, Q8_0 and Q5_0.
++enum WType : int { W_Q4_0 = 0, W_Q8_0 = 1, W_Q5_0 = 2, W_Q4_K = 3, W_Q5_K = 4, W_Q6_K = 5 };
++__host__ __device__ constexpr int wtype_group(int t) { return t >= W_Q4_K ? 8 : 1; }   // 32-value groups per block
++__host__ __device__ constexpr int wtype_bytes(int t) {
++    return t == W_Q4_0 ? 18 : t == W_Q8_0 ? 34 : t == W_Q5_0 ? 22 : t == W_Q4_K ? 144 : t == W_Q5_K ? 176 : 210;
++}
++// Repacked (qs != nullptr): Q4_0 16 quant bytes per block, Q8_0 32 (two uint4), Q5_0 16 + qh (one uint32 per
++// block); d one float16 per block. K-quants are used as stored.
++struct Q4m { const BlockQ4 *aos; const uint4 *qs; const __half *d; int type = W_Q4_0; const uint32_t *qh = nullptr;
++             const uint2 *sc = nullptr; };   // Q6_K repacked: qs = ql (8 uint4 / block), qh (4 uint4), sc (2 uint2), d
++
++struct Layer {
++    const float *attn_norm, *q_norm, *k_norm, *post_attn, *ffn_norm, *post1, *pre2, *post2, *post_ffw, *out_scale;
++    const float *router, *router_scale, *down_scale;
++    Q4m wq, wk, wv, wo, gate, up, down, gu_exps, down_exps;
++    __half *kc, *vc;               // KV cache: rows of history, the new row at index `rows`
++    int rows, dk, n_kv, full;
++};
++
++// Debug hooks (checking the kernel against stock op by op), compiled only into step<true>. Per layer and
++// watch point (llama.cpp's tensor names): the kernel records the value it computed, then optionally replaces it with a
++// supplied one (the reference's) before any consumer reads it; or plants a fault there first (fault-injection tests).
++enum Watch : int { WP_QCUR, WP_QCUR_NORMED, WP_QCUR_POS, WP_KCUR_POS, WP_VCUR_NORMED, WP_KQV_OUT, WP_ATTN_OUT,
++                   WP_MOE_LOGITS, WP_MOE_TOPK, WP_FFN_MLP, WP_FFN_MOE, WP_L_OUT, WP_N };
++__host__ __device__ constexpr int wp_size(int w) {   // largest size (full-attention layers for Q, K, V)
++    return w <= WP_QCUR_POS || w == WP_KQV_OUT ? 8192 : w <= WP_VCUR_NORMED ? 2048 : w == WP_MOE_LOGITS ? NE
++         : w == WP_MOE_TOPK ? NEU : D;
++}
++// llama.cpp's names, and the ggml shape [ne0, ne1] in layer L (Q, K, V: head dim x heads)
++inline const char *wp_name(int w) {
++    static const char *n[WP_N] = {"Qcur", "Qcur_normed", "Qcur_pos", "Kcur_pos", "Vcur_normed", "kqv_out", "attn_out",
++                                  "ffn_moe_logits", "ffn_moe_topk", "ffn_mlp", "ffn_moe", "l_out"};
++    return n[w];
++}
++inline void wp_shape(int w, int L, int &ne0, int &ne1) {
++    const int dk = is_full(L) ? 512 : 256, nkv = is_full(L) ? 2 : 8;
++    ne1 = 1;
++    if (w == WP_QCUR || w == WP_KQV_OUT) ne0 = NH * dk;
++    else if (w <= WP_QCUR_POS) { ne0 = dk; ne1 = NH; }
++    else if (w <= WP_VCUR_NORMED) { ne0 = dk; ne1 = nkv; }
++    else ne0 = wp_size(w);
++}
++__host__ __device__ constexpr int wp_off(int w) {   // a loop, not recursion: device recursion needs a dynamic stack
++    int o = 0;
++    for (int i = 0; i < w; i++) o += wp_size(i);
++    return o;
++}
++constexpr int WP_SLOT = wp_off(WP_N);   // floats per layer; result_norm (D) follows the last layer's slot
++// rec / rep layout: [layer][WP_SLOT], each watch point in ggml's element order (head-major); ffn_moe_topk is int32
++struct Dbg {
++    float *rec;              // what the kernel computed (after a planted fault), every watch point of the step
++    const float *rep;        // replacements, same layout
++    unsigned rep_mask[NL];   // per layer, bit w: replace watch point w (ffn_moe_topk: never)
++    int inj_w = -1, inj_layer = -1;   // planted fault: v = v * (1 + inj_scale) + inj_rel * rms(v) * noise[i]; rms over
++    float inj_scale, inj_rel;         // the vector, or per head for Q / K / V (a whole-tensor rms would need a grid-wide reduction)
++    const float *noise;      // unit Gaussian values for the injected watch point (wp_size)
++};
++
++struct Params {
++    const Layer *layers;
++    int L0, L1, pos, stock;
++    int wo_parts;                  // Wo row parts (<= WO_PARTS), chosen by the host so units / warps is near an integer
++    float eps;
++    const float *rope_freqs;
++    // RoPE, computed in the kernel as stock's rope kernel does: theta_j = pos * powf(theta_scale, j) (/ rope_freqs[j] on
++    // full layers); theta_scale = powf(base, -2 / n_dims) in float on the host, as stock computes it
++    const int *pos_ptr;            // position from the device (fork: the graph's inp_pos); else `pos` above
++    float ts_full, ts_swa;
++    const float *x_in;             // input of layer L0, unless tok_embd is set
++    // embedding in the kernel (fork): row `token` (or *token_ptr) of the tied Q6_K table, times embd_scale
++    const uint8_t *tok_embd;
++    const int *token_ptr;
++    int token;
++    float embd_scale;
++    // KV cache as llama.cpp keeps it (kv_ext): n_kv cells per cache (full / SWA), a float16 mask row (-inf: skip the
++    // cell), the cell the new row goes to; otherwise (standalone tests) rows + 1 contiguous rows, the new one last
++    int kv_ext;
++    int nkv_full, nkv_swa;
++    const __half *mask_full, *mask_swa;
++    const int64_t *dst_full, *dst_swa;
++    // scratch (partial buffers are [parts][rows])
++    float *qkv, *part, *o, *logits, *g, *u, *gu, *down, *moe, *l_out;
++    BlockQ8 *attq;                 // quantized attention output (8192 values)
++    unsigned *bar_count, *bar_gen, *head_count;
++    unsigned *router_count;        // router units done in this layer (the last one computes the top-8)
++    int *topk_flag;                // = epoch * 32 + layer once that layer's top-8 is in topk_ids / topk_sc; must start at a
++                                   // value no launch can match (e.g. -1): epoch 0, layer 0 would match a zeroed flag
++    int *topk_ids;
++    float *topk_sc;                // routing weight x the expert's down scale
++    int epoch;                     // distinct per launch, so a flag from an earlier launch never matches
++    int *epoch_dev;                // optional: the epoch from the device, advanced by the kernel itself (launches whose
++                                   // parameters are replayed unchanged, e.g. inside CUDA graphs)
++    int *error;
++    unsigned long long *ptimes, *arrive, *prolog;   // optional diagnostics
++    unsigned long long *sub;       // optional: [layer][16] block 0's sub-step stamps inside prologues
++    // LM head after the last layer (lm_on): final norm, the tied Q6_K embedding as LM head, argmax on the device
++    int lm_on, n_vocab;
++    Q4m lm_head;
++    const float *out_norm;
++    unsigned long long *argmax;    // (orderable value << 32) | (~token): the largest key is the argmax, ties to the lower id
++    float *logits_out;             // optional: the logits (after softcap, as stock's result_output)
++    float softcap;                 // final logit softcapping (0: none)
++    Dbg dbg;                       // step<true> only
++    // split attention (launch_layers): resume = layer L0 starts at P3 (x_in = x_save, attq from attn_kernel); stop_p1 =
++    // the launch ends after P1 of layer L1 - 1, saving the residual to x_save
++    int resume, stop_p1;
++    float *x_save;
++};
++
++// ------------------------------------------------------------------ diagnostics, barrier
++__device__ __forceinline__ unsigned long long gtimer() {
++    unsigned long long t; asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t)); return t;
++}
++__device__ __forceinline__ void stamp(const Params &p, int L, int k) {
++    if (p.ptimes && blockIdx.x == 0 && threadIdx.x == 0) p.ptimes[L * 8 + k] = gtimer();
++}
++__device__ __forceinline__ void pstamp(const Params &p, int L, int k) {
++    if (p.prolog && blockIdx.x == 0 && threadIdx.x == 0) p.prolog[L * 6 + k] = gtimer();
++}
++__device__ __forceinline__ void sstamp(const Params &p, int L, int k) {
++    if (p.sub && blockIdx.x == 0 && threadIdx.x == 0) p.sub[L * 16 + k] = gtimer();
++}
++__device__ bool grid_barrier(const Params &p, int L, int k) {
++    __syncthreads();
++    __shared__ int failed;
++    if (threadIdx.x == 0) {
++        if (p.arrive) p.arrive[((size_t)L * 6 + k) * gridDim.x + blockIdx.x] = gtimer();
++        failed = 0;
++        volatile unsigned *gen = p.bar_gen;
++        unsigned g = *gen;
++        __threadfence();
++        if (atomicAdd(p.bar_count, 1u) == gridDim.x - 1) {
++            *p.bar_count = 0;
++            __threadfence();
++            atomicAdd((unsigned *)p.bar_gen, 1u);
++        } else {
++            long long t0 = clock64();
++            while (*gen == g) {
++                if (clock64() - t0 > (1ll << 34)) { atomicExch(p.error, 1); failed = 1; break; }  // ~10 s watchdog
++            }
++        }
++        __threadfence();
++    }
++    __syncthreads();
++    return !failed;
++}
++
++// ------------------------------------------------------------------ block helpers
++// two block-wide sums at once (one pair of barriers)
++__device__ float2 blk_sum2(float a, float b) {
++    __shared__ float2 red2[WARPS];
++    int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
++    a = warp_sum(a); b = warp_sum(b);
++    __syncthreads();
++    if (lane == 0) red2[w] = make_float2(a, b);
++    __syncthreads();
++    float2 r = make_float2(0.f, 0.f);
++    for (int i = 0; i < WARPS; i++) { r.x += red2[i].x; r.y += red2[i].y; }
++    return r;
++}
++// q8_1 quantization, 8 lanes per 32-value group (4 values per lane), 4 groups per warp step.
++// x: n values (n % 32 == 0, 16-byte aligned), q: n / 32 groups (shared or global). Ends with __syncthreads().
++__device__ void blk_quantize(const float *x, BlockQ8 *q, int n) {
++    const int lane = threadIdx.x & 31, sub = lane & 7, gw = lane >> 3, ng = n / 32;
++    for (int gb = (threadIdx.x >> 5) * 4; gb < ng; gb += (blockDim.x >> 5) * 4) {   // warp-uniform: shuffles stay full-warp
++        const int gi = gb + gw;
++        const bool ok = gi < ng;
++        float4 v = ok ? *(const float4 *)(x + gi * 32 + 4 * sub) : make_float4(0.f, 0.f, 0.f, 0.f);
++        float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
++        for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
++        float d = amax / 127.f, id = d > 0.f ? 1.f / d : 0.f;
++        int q0 = __float2int_rn(v.x * id), q1 = __float2int_rn(v.y * id), q2 = __float2int_rn(v.z * id), q3 = __float2int_rn(v.w * id);
++        if (d == 0.f) { q0 = q1 = q2 = q3 = 0; }
++        int sq = q0 + q1 + q2 + q3;
++        float s = v.x + v.y + v.z + v.w;
++        for (int o = 4; o > 0; o >>= 1) { sq += __shfl_xor_sync(0xffffffff, sq, o); s += __shfl_xor_sync(0xffffffff, s, o); }
++        if (ok) {
++            *(int *)(q[gi].q + 4 * sub) = (q0 & 0xff) | ((q1 & 0xff) << 8) | ((q2 & 0xff) << 16) | ((q3 & 0xff) << 24);
++            if (sub == 0) { q[gi].d = d; q[gi].s = s; q[gi].sumq = sq; }
++        }
++    }
++    __syncthreads();
++}
++
++__device__ __forceinline__ float q4_block_dot(int sumi, float dw, const BlockQ8 &xb, int stock) {
++    float dx = __half2float(__float2half(xb.d));
++    return stock ? dw * (sumi * dx - 8.f * __half2float(__float2half(xb.s))) : dw * dx * (float)(sumi - 8 * xb.sumq);
++}
++// ---- other formats, stock's MMVQ arithmetic (vecdotq.cuh) on this kernel's q8_1 blocks (scale rounded to float16
++// as llama.cpp stores it). Groups are 32-value units of the row; for K-quants g0 and ng are multiples of 8.
++__device__ __forceinline__ int ld_i2(const uint8_t *p) {   // 2-byte aligned int
++    const uint16_t *q = (const uint16_t *)p; return (int)q[0] | ((int)q[1] << 16);
++}
++__device__ __forceinline__ float half_r(float v) { return __half2float(__float2half(v)); }
++__device__ float dot_q8_0_soa(const Q4m &m, size_t g0, const BlockQ8 *x, int ng) {
++    const int lane = threadIdx.x & 31;
++    float acc = 0.f;
++    for (int g = lane; g < ng; g += 32) {
++        const uint4 a = __ldg(m.qs + 2 * (g0 + g)), b = __ldg(m.qs + 2 * (g0 + g) + 1);
++        const int *xq = (const int *)x[g].q;
++        int sumi = 0;
++        sumi = __dp4a((int)a.x, xq[0], sumi); sumi = __dp4a((int)a.y, xq[1], sumi);
++        sumi = __dp4a((int)a.z, xq[2], sumi); sumi = __dp4a((int)a.w, xq[3], sumi);
++        sumi = __dp4a((int)b.x, xq[4], sumi); sumi = __dp4a((int)b.y, xq[5], sumi);
++        sumi = __dp4a((int)b.z, xq[6], sumi); sumi = __dp4a((int)b.w, xq[7], sumi);
++        acc += __half2float(__ldg(m.d + g0 + g)) * half_r(x[g].d) * (float)sumi;
++    }
++    return warp_sum(acc);
++}
++__device__ float dot_q5_0_soa(const Q4m &m, size_t g0, const BlockQ8 *x, int ng, int stock) {
++    const int lane = threadIdx.x & 31;
++    float acc = 0.f;
++    for (int g = lane; g < ng; g += 32) {
++        const uint4 w = __ldg(m.qs + g0 + g);
++        const int qh = (int)__ldg(m.qh + g0 + g);
++        const int vls[4] = {(int)w.x, (int)w.y, (int)w.z, (int)w.w};
++        const int *xq = (const int *)x[g].q;
++        int sumi = 0;
++#pragma unroll
++        for (int i = 0; i < 4; i++) {
++            const int vl = vls[i], vh = qh >> (4 * i);
++            int vi0 = (vl >> 0) & 0x0F0F0F0F;
++            vi0 |= (vh << 4) & 0x00000010; vi0 |= (vh << 11) & 0x00001000; vi0 |= (vh << 18) & 0x00100000; vi0 |= (vh << 25) & 0x10000000;
++            sumi = __dp4a(vi0, xq[i], sumi);
++            int vi1 = (vl >> 4) & 0x0F0F0F0F;
++            vi1 |= (vh >> 12) & 0x00000010; vi1 |= (vh >> 5) & 0x00001000; vi1 |= (vh << 2) & 0x00100000; vi1 |= (vh << 9) & 0x10000000;
++            sumi = __dp4a(vi1, xq[i + 4], sumi);
++        }
++        const float d5 = __half2float(__ldg(m.d + g0 + g)), dx = half_r(x[g].d);
++        acc += stock ? d5 * (sumi * dx - 16.f * half_r(x[g].s)) : d5 * dx * (float)(sumi - 16 * x[g].sumq);
++    }
++    return warp_sum(acc);
++}
++__device__ float dot_q8_0(const uint8_t *row, size_t g0, const BlockQ8 *x, int ng) {
++    const int lane = threadIdx.x & 31;
++    float acc = 0.f;
++    for (int g = lane; g < ng; g += 32) {
++        const uint8_t *b = row + (g0 + g) * 34;
++        const int *xq = (const int *)x[g].q;
++        int sumi = 0;
++#pragma unroll
++        for (int i = 0; i < 8; i++) sumi = __dp4a(ld_i2(b + 2 + 4 * i), xq[i], sumi);
++        acc += __half2float(*(const __half *)b) * half_r(x[g].d) * (float)sumi;
++    }
++    return warp_sum(acc);
++}
++__device__ float dot_q5_0(const uint8_t *row, size_t g0, const BlockQ8 *x, int ng, int stock) {
++    const int lane = threadIdx.x & 31;
++    float acc = 0.f;
++    for (int g = lane; g < ng; g += 32) {
++        const uint8_t *b = row + (g0 + g) * 22;
++        const int qh = ld_i2(b + 2);
++        const int *xq = (const int *)x[g].q;
++        int sumi = 0;
++#pragma unroll
++        for (int i = 0; i < 4; i++) {
++            const int vl = ld_i2(b + 6 + 4 * i), vh = qh >> (4 * i);
++            int vi0 = (vl >> 0) & 0x0F0F0F0F;
++            vi0 |= (vh << 4) & 0x00000010; vi0 |= (vh << 11) & 0x00001000; vi0 |= (vh << 18) & 0x00100000; vi0 |= (vh << 25) & 0x10000000;
++            sumi = __dp4a(vi0, xq[i], sumi);
++            int vi1 = (vl >> 4) & 0x0F0F0F0F;
++            vi1 |= (vh >> 12) & 0x00000010; vi1 |= (vh >> 5) & 0x00001000; vi1 |= (vh << 2) & 0x00100000; vi1 |= (vh << 9) & 0x10000000;
++            sumi = __dp4a(vi1, xq[i + 4], sumi);
++        }
++        const float d5 = __half2float(*(const __half *)b), dx = half_r(x[g].d);
++        acc += stock ? d5 * (sumi * dx - 16.f * half_r(x[g].s)) : d5 * dx * (float)(sumi - 16 * x[g].sumq);
++    }
++    return warp_sum(acc);
++}
++// Q4_K / Q5_K: 16 slots of 2 ints per 256-value block (vdr 2); Q6_K: 32 slots of 1 int (vdr 1). One slot per lane.
++__device__ __forceinline__ void kq_scales(const uint8_t *scales12, int bq8_offset, uint8_t &sc0, uint8_t &sc1, uint8_t &m0, uint8_t &m1) {
++    const uint16_t *scales = (const uint16_t *)scales12;
++    const int j = bq8_offset / 2, jm = j & 1;
++    const uint32_t s0 = scales[jm + 0], s2 = scales[jm + 2], s4 = scales[jm + 4];
++    const uint32_t hi = (uint32_t) - (int32_t)(j >= 2);
++    const uint16_t a0 = (uint16_t)(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
++    const uint16_t a1 = (uint16_t)(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
++    sc0 = a0 & 0xff; sc1 = a0 >> 8; m0 = a1 & 0xff; m1 = a1 >> 8;
++}
++template <int TYPE>
++__device__ float dot_kq(const uint8_t *row, size_t g0, const BlockQ8 *x, int ng) {
++    const int lane = threadIdx.x & 31;
++    constexpr int SLOTS = TYPE == W_Q6_K ? 32 : 16, BYTES = wtype_bytes(TYPE);
++    const int nsb = ng / 8;
++    const uint8_t *base = row + (g0 / 8) * BYTES;
++    float acc = 0.f;
++    for (int s = lane; s < nsb * SLOTS; s += 32) {
++        const int kbx = s / SLOTS, slot = s % SLOTS;
++        const uint8_t *b = base + (size_t)kbx * BYTES;
++        const BlockQ8 *xb = x + kbx * 8;
++        if (TYPE == W_Q4_K || TYPE == W_Q5_K) {
++            const int iqs = 2 * slot;
++            const int bq8_offset = 2 * ((iqs / 2) / 4);
++            const uint8_t *qs = b + 4 + 12 + (TYPE == W_Q5_K ? 32 : 0);
++            const int *q4 = (const int *)(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
++            int v0 = q4[0], v1 = q4[4], h0 = 0, h1 = 0;
++            if (TYPE == W_Q5_K) {
++                const int *qh = (const int *)(b + 16 + 4 * ((iqs / 2) % 4));
++                h0 = qh[0] >> bq8_offset; h1 = qh[4] >> bq8_offset;
++            }
++            uint8_t sc[2], mm[2];
++            kq_scales(b + 4, bq8_offset, sc[0], sc[1], mm[0], mm[1]);
++            float sumf_d = 0.f, sumf_m = 0.f;
++#pragma unroll
++            for (int i = 0; i < 2; i++) {
++                const BlockQ8 &xi = xb[bq8_offset + i];
++                const int *q8 = (const int *)xi.q + ((iqs / 2) % 4);
++                const int u0 = q8[0], u1 = q8[4];
++                int a0 = (v0 >> (4 * i)) & 0x0F0F0F0F, a1 = (v1 >> (4 * i)) & 0x0F0F0F0F;
++                int dot1;
++                if (TYPE == W_Q5_K) {
++                    a0 |= ((h0 >> i) << 4) & 0x10101010; a1 |= ((h1 >> i) << 4) & 0x10101010;
++                    dot1 = __dp4a(a0, u0, __dp4a(a1, u1, 0));
++                } else dot1 = __dp4a(a1, u1, __dp4a(a0, u0, 0));
++                const int dot2 = TYPE == W_Q5_K ? __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0))
++                                                : __dp4a(0x01010101, u1, __dp4a(0x01010101, u0, 0));
++                const float d8 = half_r(xi.d);
++                sumf_d += d8 * (dot1 * sc[i]);
++                sumf_m += d8 * (dot2 * mm[i]);
++            }
++            const float2 dm = __half22float2(*(const __half2 *)b);
++            acc += dm.x * sumf_d - dm.y * sumf_m;
++        } else {   // Q6_K: ql[128] qh[64] scales[16] d
++            const int iqs = slot;
++            const int bq8_offset = 2 * 2 * (iqs / 16) + (iqs % 16) / 8;
++            const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
++            const int vh_shift = 2 * ((iqs % 16) / 8);
++            const int vl = ld_i2(b + 4 * iqs);
++            const int vh = ld_i2(b + 128 + 4 * (8 * (iqs / 16) + iqs % 8)) >> vh_shift;
++            const int8_t *scales = (const int8_t *)(b + 192) + scale_offset;
++            float sumf = 0.f;
++#pragma unroll
++            for (int i = 0; i < 2; i++) {
++                const BlockQ8 &xi = xb[bq8_offset + 2 * i];
++                const int u = ((const int *)xi.q)[iqs % 8];
++                const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
++                const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
++                const int vi = __vsub4((vil | vih), 0x20202020);
++                sumf += half_r(xi.d) * (__dp4a(vi, u, 0) * scales[4 * i]);
++            }
++            acc += __half2float(*(const __half *)(b + 208)) * sumf;
++        }
++    }
++    return warp_sum(acc);
++}
++
++// Q4_K / Q5_K, one lane per 64-value chunk c (4 per 256-value block): its 32 quant bytes as two 16-byte loads, both
++// groups' scale and min decoded once. Same arithmetic as stock's (the min term uses the exact integer sum of the
++// q8_1 values, which is what stock's dp4a(0x01010101, u) computes).
++__device__ __forceinline__ void kq_scale_min(const uint8_t *q, int j, int &sc, int &m) {
++    if (j < 4) { sc = q[j] & 63; m = q[j + 4] & 63; }
++    else { sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
++}
++template <int TYPE>
++__device__ float dot_kq2(const uint8_t *row, size_t g0, const BlockQ8 *x, int ng) {
++    const int lane = threadIdx.x & 31;
++    constexpr int BYTES = wtype_bytes(TYPE), QS = TYPE == W_Q5_K ? 48 : 16;
++    const int nitems = ng / 2;   // 64-value chunks
++    const uint8_t *base = row + (g0 / 8) * BYTES;
++    float acc = 0.f;
++    for (int it = lane; it < nitems; it += 32) {
++        const int kb = it / 4, c = it % 4;
++        const uint8_t *b = base + (size_t)kb * BYTES;
++        const uint4 qa = __ldg((const uint4 *)(b + QS + 32 * c)), qb = __ldg((const uint4 *)(b + QS + 32 * c + 16));
++        const int q[8] = {(int)qa.x, (int)qa.y, (int)qa.z, (int)qa.w, (int)qb.x, (int)qb.y, (int)qb.z, (int)qb.w};
++        int hq[8];
++        if (TYPE == W_Q5_K) {
++            const uint4 ha = __ldg((const uint4 *)(b + 16)), hb = __ldg((const uint4 *)(b + 32));
++            const int h[8] = {(int)ha.x, (int)ha.y, (int)ha.z, (int)ha.w, (int)hb.x, (int)hb.y, (int)hb.z, (int)hb.w};
++#pragma unroll
++            for (int k = 0; k < 8; k++) hq[k] = h[k];
++        }
++        const BlockQ8 &xl = x[kb * 8 + 2 * c], &xh = x[kb * 8 + 2 * c + 1];
++        const int *ul = (const int *)xl.q, *uh = (const int *)xh.q;
++        int sl = 0, sh = 0;
++#pragma unroll
++        for (int k = 0; k < 8; k++) {
++            int lo = q[k] & 0x0F0F0F0F, hi = (q[k] >> 4) & 0x0F0F0F0F;
++            if (TYPE == W_Q5_K) {
++                lo |= ((hq[k] >> (2 * c)) & 0x01010101) << 4;
++                hi |= ((hq[k] >> (2 * c + 1)) & 0x01010101) << 4;
++            }
++            sl = __dp4a(lo, ul[k], sl);
++            sh = __dp4a(hi, uh[k], sh);
++        }
++        int sc0, m0, sc1, m1;
++        kq_scale_min(b + 4, 2 * c, sc0, m0);
++        kq_scale_min(b + 4, 2 * c + 1, sc1, m1);
++        const float2 dm = __half22float2(*(const __half2 *)b);
++        const float d8l = half_r(xl.d), d8h = half_r(xh.d);
++        const float sumf_d = d8l * (float)(sl * sc0) + d8h * (float)(sh * sc1);
++        const float sumf_m = d8l * (float)(xl.sumq * m0) + d8h * (float)(xh.sumq * m1);
++        acc += dm.x * sumf_d - dm.y * sumf_m;
++    }
++    return warp_sum(acc);
++}
++// Q6_K repacked, one lane per 128-value half block: ql 64 bytes, qh 32, scales 8 as wide loads; the 16-value integer
++// dots are scaled in integers, then by the q8_1 scale (per 32) and d (per block)
++__device__ float dot_q6k_soa(const Q4m &m, size_t g0, const BlockQ8 *x, int ng) {
++    const int lane = threadIdx.x & 31;
++    const size_t sb0 = g0 / 8;
++    const int nitems = ng / 4;                    // halves: ng / 8 blocks x 2
++    const uint4 *qlv = m.qs; const uint4 *qhv = (const uint4 *)m.qh;
++    float acc = 0.f;
++    for (int it = lane; it < nitems; it += 32) {
++        const int kb = it / 2, n = it % 2;
++        const size_t sb = sb0 + kb;
++        const uint4 l0 = __ldg(qlv + sb * 8 + n * 4), l1 = __ldg(qlv + sb * 8 + n * 4 + 1);
++        const uint4 l2 = __ldg(qlv + sb * 8 + n * 4 + 2), l3 = __ldg(qlv + sb * 8 + n * 4 + 3);
++        const uint4 h0 = __ldg(qhv + sb * 4 + n * 2), h1 = __ldg(qhv + sb * 4 + n * 2 + 1);
++        const uint2 scw = __ldg(m.sc + sb * 2 + n);
++        const int qa[8] = {(int)l0.x, (int)l0.y, (int)l0.z, (int)l0.w, (int)l1.x, (int)l1.y, (int)l1.z, (int)l1.w};   // ql[l]
++        const int qb[8] = {(int)l2.x, (int)l2.y, (int)l2.z, (int)l2.w, (int)l3.x, (int)l3.y, (int)l3.z, (int)l3.w};   // ql[l + 32]
++        const int qh8[8] = {(int)h0.x, (int)h0.y, (int)h0.z, (int)h0.w, (int)h1.x, (int)h1.y, (int)h1.z, (int)h1.w};
++        const int8_t *sc8 = (const int8_t *)&scw;
++        const BlockQ8 *xb = x + kb * 8 + n * 4;
++        float item = 0.f;
++#pragma unroll
++        for (int k = 0; k < 4; k++) {   // the 4 groups of 32: ql low / ql+32 low / ql high / ql+32 high
++            const int *u = (const int *)xb[k].q;
++            int s_lo = 0, s_hi = 0;
++#pragma unroll
++            for (int wi = 0; wi < 8; wi++) {
++                const int ql = k & 1 ? qb[wi] : qa[wi];
++                const int lo = k < 2 ? ql & 0x0F0F0F0F : (ql >> 4) & 0x0F0F0F0F;
++                const int hb = (qh8[wi] >> (2 * k)) & 0x03030303;
++                const int v = __vsub4(lo | (hb << 4), 0x20202020);
++                if (wi < 4) s_lo = __dp4a(v, u[wi], s_lo); else s_hi = __dp4a(v, u[wi], s_hi);
++            }
++            item += half_r(xb[k].d) * (float)(s_lo * sc8[2 * k] + s_hi * sc8[2 * k + 1]);
++        }
++        acc += __half2float(__ldg(m.d + sb)) * item;
++    }
++    return warp_sum(acc);
++}
++
++// Q4_0 blocks [b0, b0 + nb) . q8_1 vector x[0 .. nb), warp-wide; result in every lane. For other formats b0 and nb
++// count 32-value groups of the row-major matrix (row r, group g at r * groups_per_row + g).
++__device__ __forceinline__ float warp_dot_q4(const Q4m &m, size_t b0, const BlockQ8 *x, int nb, int stock) {
++    int lane = threadIdx.x & 31;
++    float acc = 0.f;
++    if (m.type != W_Q4_0) {
++        const uint8_t *raw = (const uint8_t *)m.aos;
++        switch (m.type) {
++            case W_Q8_0: return m.qs ? dot_q8_0_soa(m, b0, x, nb) : dot_q8_0(raw, b0, x, nb);
++            case W_Q5_0: return m.qs ? dot_q5_0_soa(m, b0, x, nb, stock) : dot_q5_0(raw, b0, x, nb, stock);
++            case W_Q4_K: return dot_kq2<W_Q4_K>(raw, b0, x, nb);
++            case W_Q5_K: return dot_kq2<W_Q5_K>(raw, b0, x, nb);
++            default:     return m.sc ? dot_q6k_soa(m, b0, x, nb) : dot_kq<W_Q6_K>(raw, b0, x, nb);
++        }
++    }
++    if (m.qs) {
++#pragma unroll 4
++        for (int b = lane; b < nb; b += 32) {
++            uint4 w = __ldg(m.qs + b0 + b);
++            float dw = __half2float(__ldg(m.d + b0 + b));
++            const int *xq = (const int *)x[b].q;
++            int sumi = 0;
++            sumi = __dp4a((int)w.x & 0x0F0F0F0F, xq[0], sumi); sumi = __dp4a(((int)w.x >> 4) & 0x0F0F0F0F, xq[4], sumi);
++            sumi = __dp4a((int)w.y & 0x0F0F0F0F, xq[1], sumi); sumi = __dp4a(((int)w.y >> 4) & 0x0F0F0F0F, xq[5], sumi);
++            sumi = __dp4a((int)w.z & 0x0F0F0F0F, xq[2], sumi); sumi = __dp4a(((int)w.z >> 4) & 0x0F0F0F0F, xq[6], sumi);
++            sumi = __dp4a((int)w.w & 0x0F0F0F0F, xq[3], sumi); sumi = __dp4a(((int)w.w >> 4) & 0x0F0F0F0F, xq[7], sumi);
++            acc += q4_block_dot(sumi, dw, x[b], stock);
++        }
++        return warp_sum(acc);
++    }
++    const BlockQ4 *wr = m.aos + b0;
++#pragma unroll 2
++    for (int b = lane; b < nb; b += 32) {
++        const BlockQ4 &wb = wr[b];
++        const uint16_t *q16 = (const uint16_t *)wb.qs;
++        const int *xq = (const int *)x[b].q;
++        int sumi = 0;
++#pragma unroll
++        for (int i = 0; i < 4; i++) {
++            int w4 = (int)__ldg(q16 + 2 * i) | ((int)__ldg(q16 + 2 * i + 1) << 16);
++            sumi = __dp4a(w4 & 0x0F0F0F0F, xq[i], sumi);
++            sumi = __dp4a((w4 >> 4) & 0x0F0F0F0F, xq[i + 4], sumi);
++        }
++        acc += q4_block_dot(sumi, __half2float(__ldg(&wb.d)), x[b], stock);
++    }
++    return warp_sum(acc);
++}
++
++// Up to U units at once (independent rows / partial rows, possibly of different matrices and lengths): all their
++// loads for one 32-block step are issued before any is used, so a warp keeps U requests in flight. out[k] gets
++// unit k's dot product in every lane.
++struct Unit { Q4m m; size_t b0; const BlockQ8 *x; int nb; };   // the descriptor by value: no dependent load
++__device__ __forceinline__ void q4_load(const Q4m &m, size_t b, int4 &w, float &dw) {
++    if (m.qs) { uint4 v = __ldg(m.qs + b); w = make_int4((int)v.x, (int)v.y, (int)v.z, (int)v.w); dw = __half2float(__ldg(m.d + b)); }
++    else {
++        const BlockQ4 &wb = m.aos[b];
++        const uint16_t *q16 = (const uint16_t *)wb.qs;
++        int t[4];
++#pragma unroll
++        for (int i = 0; i < 4; i++) t[i] = (int)__ldg(q16 + 2 * i) | ((int)__ldg(q16 + 2 * i + 1) << 16);
++        w = make_int4(t[0], t[1], t[2], t[3]); dw = __half2float(__ldg(&wb.d));
++    }
++}
++// One 32-value group of a Q4_0 / Q8_0 / Q5_0 matrix (AoS or repacked) times one q8_1 block: the per-block part of
++// warp_dot_q4 and dot_q8_0 / dot_q5_0 (same arithmetic), for layouts where a lane group shares a row.
++__device__ __forceinline__ float blk_dot(const Q4m &m, size_t b, const BlockQ8 &xb, int stock) {
++    const int *xq = (const int *)xb.q;
++    int sumi = 0;
++    if (m.type == W_Q4_0) {
++        int4 w; float dw;
++        q4_load(m, b, w, dw);
++        sumi = __dp4a(w.x & 0x0F0F0F0F, xq[0], sumi); sumi = __dp4a((w.x >> 4) & 0x0F0F0F0F, xq[4], sumi);
++        sumi = __dp4a(w.y & 0x0F0F0F0F, xq[1], sumi); sumi = __dp4a((w.y >> 4) & 0x0F0F0F0F, xq[5], sumi);
++        sumi = __dp4a(w.z & 0x0F0F0F0F, xq[2], sumi); sumi = __dp4a((w.z >> 4) & 0x0F0F0F0F, xq[6], sumi);
++        sumi = __dp4a(w.w & 0x0F0F0F0F, xq[3], sumi); sumi = __dp4a((w.w >> 4) & 0x0F0F0F0F, xq[7], sumi);
++        return q4_block_dot(sumi, dw, xb, stock);
++    }
++    if (m.type == W_Q8_0) {
++        int v[8]; float dw;
++        if (m.qs) {
++            const uint4 a = __ldg(m.qs + 2 * b), c = __ldg(m.qs + 2 * b + 1);
++            v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = c.x; v[5] = c.y; v[6] = c.z; v[7] = c.w;
++            dw = __half2float(__ldg(m.d + b));
++        } else {
++            const uint8_t *bp = (const uint8_t *)m.aos + b * 34;
++#pragma unroll
++            for (int i = 0; i < 8; i++) v[i] = ld_i2(bp + 2 + 4 * i);
++            dw = __half2float(*(const __half *)bp);
++        }
++#pragma unroll
++        for (int i = 0; i < 8; i++) sumi = __dp4a(v[i], xq[i], sumi);
++        return dw * half_r(xb.d) * (float)sumi;
++    }
++    // Q5_0
++    int vls[4], qh; float d5;
++    if (m.qs) {
++        const uint4 w = __ldg(m.qs + b);
++        vls[0] = w.x; vls[1] = w.y; vls[2] = w.z; vls[3] = w.w;
++        qh = (int)__ldg(m.qh + b); d5 = __half2float(__ldg(m.d + b));
++    } else {
++        const uint8_t *bp = (const uint8_t *)m.aos + b * 22;
++        qh = ld_i2(bp + 2);
++#pragma unroll
++        for (int i = 0; i < 4; i++) vls[i] = ld_i2(bp + 6 + 4 * i);
++        d5 = __half2float(*(const __half *)bp);
++    }
++#pragma unroll
++    for (int i = 0; i < 4; i++) {
++        const int vl = vls[i], vh = qh >> (4 * i);
++        int vi0 = (vl >> 0) & 0x0F0F0F0F;
++        vi0 |= (vh << 4) & 0x00000010; vi0 |= (vh << 11) & 0x00001000; vi0 |= (vh << 18) & 0x00100000; vi0 |= (vh << 25) & 0x10000000;
++        sumi = __dp4a(vi0, xq[i], sumi);
++        int vi1 = (vl >> 4) & 0x0F0F0F0F;
++        vi1 |= (vh >> 12) & 0x00000010; vi1 |= (vh >> 5) & 0x00001000; vi1 |= (vh << 2) & 0x00100000; vi1 |= (vh << 9) & 0x10000000;
++        sumi = __dp4a(vi1, xq[i + 4], sumi);
++    }
++    const float dx = half_r(xb.d);
++    return stock ? d5 * (sumi * dx - 16.f * half_r(xb.s)) : d5 * dx * (float)(sumi - 16 * xb.sumq);
++}
++
++// L2 prefetch of a byte range (one 128-byte line per lane per step)
++__device__ __forceinline__ void pf_bytes(const void *base, size_t bytes) {
++#ifdef PK_NOPF
++    return;   // diagnostics: no L2 prefetching at all
++#endif
++    int lane = threadIdx.x & 31;
++    for (size_t off = (size_t)lane * 128; off < bytes; off += 32 * 128)
++        asm volatile("prefetch.global.L2 [%0];" :: "l"((const char *)base + off));
++}
++__device__ __forceinline__ void pf_blocks(const Q4m &m, size_t b0, int nb) {   // b0, nb in 32-value groups
++    if (m.type != W_Q4_0 && m.qs) {   // repacked Q8_0 / Q5_0
++        const int qb = m.type == W_Q8_0 ? 32 : 16;
++        pf_bytes((const uint8_t *)m.qs + b0 * qb, (size_t)nb * qb); pf_bytes(m.d + b0, (size_t)nb * 2);
++        if (m.qh) pf_bytes(m.qh + b0, (size_t)nb * 4);
++    } else if (m.type != W_Q4_0) {
++        const int g = wtype_group(m.type), by = wtype_bytes(m.type);
++        pf_bytes((const uint8_t *)m.aos + b0 / g * by, (size_t)nb / g * by);
++    } else if (m.qs) { pf_bytes(m.qs + b0, (size_t)nb * 16); pf_bytes(m.d + b0, (size_t)nb * 2); }
++    else pf_bytes(m.aos + b0, (size_t)nb * sizeof(BlockQ4));
++}
++// part `part` of `parts` of a row of ng groups, on boundaries that are multiples of `align` groups: (first, count)
++__device__ __forceinline__ int2 prange(int ng, int parts, int part, int align) {
++    const int a = (ng * part / parts) / align * align;
++    const int b = part == parts - 1 ? ng : (ng * (part + 1) / parts) / align * align;
++    return make_int2(a, b - a);
++}
++
++__device__ __forceinline__ int warp_global() { return blockIdx.x * WARPS + (threadIdx.x >> 5); }
++__device__ __forceinline__ int warps_total() { return gridDim.x * WARPS; }
++
++// This warp's units in [u_begin, u_end) (static assignment u = warp + k x warps), one at a time.
++// gen(u, Unit &) describes unit u; sink(u, value) stores its result (called in every lane).
++template <class Gen, class Sink>
++__device__ __forceinline__ void run_units(int u_begin, int u_end, int stock, Gen gen, Sink sink) {
++    const int W = warps_total();
++    int u = warp_global();
++    if (u < u_begin) u += ((u_begin - u + W - 1) / W) * W;
++    for (; u < u_end; u += W) {   // one unit at a time: batching several was slower
++        Unit un; gen(u, un);
++        sink(u, warp_dot_q4(un.m, un.b0, un.x, un.nb, stock));
++    }
++}
++
++// ------------------------------------------------------------------ attention (P2)
++// Lane layout for a head of d values: lane holds elements e = 64 t + 2 lane + {0, 1}, t < d / 64, as float2.
++// RoPE pairs e with e + d/2, which is t + d/128 in the same lane, so norms and rotations stay in registers.
++template <int T>  // T = d / 64; the head's raw values are the sum of the two Q/K/V partial units
++__device__ __forceinline__ void load_head(const float *src, float2 (&v)[T]) {
++    int lane = threadIdx.x & 31;
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++        float2 a = __ldcg((const float2 *)(src + 64 * t + 2 * lane));
++        float2 b = __ldcg((const float2 *)(src + QKV_MAX + 64 * t + 2 * lane));
++        v[t] = make_float2(a.x + b.x, a.y + b.y);
++    }
++}
++template <int T>
++__device__ __forceinline__ void head_norm(float2 (&v)[T], const float *w, float eps) {
++    int lane = threadIdx.x & 31;
++    float ss = 0.f;
++#pragma unroll
++    for (int t = 0; t < T; t++) ss += v[t].x * v[t].x + v[t].y * v[t].y;
++    float r = rsqrtf(warp_sum(ss) / (64 * T) + eps);
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++        int e = 64 * t + 2 * lane;
++        v[t].x *= r * (w ? w[e] : 1.f); v[t].y *= r * (w ? w[e + 1] : 1.f);
++    }
++}
++template <int T>
++__device__ __forceinline__ void head_rope(float2 (&v)[T], const float2 *cs) {
++    int lane = threadIdx.x & 31;
++#pragma unroll
++    for (int t = 0; t < T / 2; t++) {
++        int e = 64 * t + 2 * lane;
++        float2 a = v[t], b = v[t + T / 2], c0 = cs[e], c1 = cs[e + 1];
++        v[t] = make_float2(a.x * c0.x - b.x * c0.y, a.y * c1.x - b.y * c1.y);
++        v[t + T / 2] = make_float2(a.x * c0.y + b.x * c0.x, a.y * c1.y + b.y * c1.x);
++    }
++}
++template <int T>
++__device__ __forceinline__ void norm_rope(float2 (&v)[T], const float *w, const float2 *cs, float eps) {
++    head_norm<T>(v, w, eps);
++    if (cs) head_rope<T>(v, cs);
++}
++// ---- debug hooks (step<true>)
++__device__ __forceinline__ bool dbg_injecting(const Params &p, int w, int L) { return p.dbg.inj_w == w && p.dbg.inj_layer == L; }
++// element i of watch point w in layer L: plant the fault (rms: of the vector, needed only when injecting), record (if
++// this thread is the writer), replace
++__device__ __forceinline__ float dbg_hook(const Params &p, int w, int L, int i, float v, float rms, bool writer) {
++    const Dbg &g = p.dbg;
++    if (dbg_injecting(p, w, L)) v = v * (1.f + g.inj_scale) + g.inj_rel * rms * g.noise[i];
++    const size_t at = (size_t)L * WP_SLOT + wp_off(w) + i;
++    if (writer) g.rec[at] = v;
++    return (g.rep_mask[L] >> w & 1) ? g.rep[at] : v;
++}
++// a head (d = 64 T values in a warp) at element offset `base` of watch point w
++template <int T>
++__device__ __forceinline__ void dbg_head(const Params &p, int w, int L, int base, float2 (&v)[T], bool writer) {
++    const int lane = threadIdx.x & 31;
++    float rms = 0.f;
++    if (dbg_injecting(p, w, L)) {
++        float ss = 0.f;
++#pragma unroll
++        for (int t = 0; t < T; t++) ss += v[t].x * v[t].x + v[t].y * v[t].y;
++        rms = sqrtf(warp_sum(ss) / (64 * T));
++    }
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++        const int e = base + 64 * t + 2 * lane;
++        v[t] = make_float2(dbg_hook(p, w, L, e, v[t].x, rms, writer), dbg_hook(p, w, L, e + 1, v[t].y, rms, writer));
++    }
++}
++// a D-vector held E values per thread (block-wide; every block computes the same vector, block 0 records it)
++__device__ __forceinline__ void dbg_vec(const Params &p, int w, int L, float (&v)[E]) {
++    float rms = 0.f;
++    if (dbg_injecting(p, w, L)) {
++        float ss = 0.f;
++#pragma unroll
++        for (int j = 0; j < E; j++) ss += v[j] * v[j];
++        rms = sqrtf(blk_sum2(ss, 0.f).x / D);
++    }
++#pragma unroll
++    for (int j = 0; j < E; j++) {
++        const int i = threadIdx.x + j * THREADS;
++        if (i < D) v[j] = dbg_hook(p, w, L, i, v[j], rms, blockIdx.x == 0);
++    }
++}
++// this layer's view of its KV cache
++struct KvView { int n, dst; const __half *mask; };
++__device__ __forceinline__ KvView kv_view(const Params &p, const Layer &Ly) {
++    if (!p.kv_ext) return KvView{Ly.rows + 1, Ly.rows, nullptr};
++    return Ly.full ? KvView{p.nkv_full, (int)*p.dst_full, p.mask_full} : KvView{p.nkv_swa, (int)*p.dst_swa, p.mask_swa};
++}
++// (cos, sin) tables for this position: 256 entries (full layers, d 512) and 128 (sliding, d 256)
++__device__ void rope_tables(const Params &p, float2 *cs_full, float2 *cs_swa) {
++    const float pos = (float)(p.pos_ptr ? *p.pos_ptr : p.pos);
++    for (int i = threadIdx.x; i < 256 + 128; i += blockDim.x) {
++        const bool full = i < 256;
++        const int j = full ? i : i - 256;
++        float th = pos * powf(full ? p.ts_full : p.ts_swa, (float)j);
++        if (full) th = th / p.rope_freqs[j];
++        (full ? cs_full : cs_swa)[j] = make_float2(cosf(th), sinf(th));
++    }
++}
++// head h's output from its chunks' partials (p.part: [h][chunk][d + 2] = max, sum, unnormalized accumulator), quantized
++// into p.attq (o: d floats of shared scratch); the caller has seen every chunk's partials (fence) and syncs after
++template <bool DBG>
++__device__ void attn_merge(const Params &p, int L, int h, int nchunks, int d, float *o) {
++    const int stride = d + 2;
++    const float *ph = p.part + (size_t)h * nchunks * stride;
++    float MM = -INFINITY;
++    for (int cc = 0; cc < nchunks; cc++) MM = fmaxf(MM, __ldcg(ph + cc * stride));
++    float LL = 0.f;
++    for (int cc = 0; cc < nchunks; cc++) LL += __ldcg(ph + cc * stride + 1) * expf(__ldcg(ph + cc * stride) - MM);
++    for (int i = threadIdx.x; i < d; i += blockDim.x) {
++        float a = 0.f;
++        for (int cc = 0; cc < nchunks; cc++) a += __ldcg(ph + cc * stride + 2 + i) * expf(__ldcg(ph + cc * stride) - MM);
++        o[i] = a / LL;
++        if (DBG) o[i] = dbg_hook(p, WP_KQV_OUT, L, h * d + i, o[i], 0.f, true);   // a fault here: scale only
++    }
++    __syncthreads();
++    blk_quantize(o, p.attq + h * (d / 32), d);
++}
++// AWN: warps of the block that walk positions (scratch: AWN x (d + 2) floats, then q and the new K / V row); U: positions
++// per warp iteration (U > 1 needs registers past the persistent kernel's 80: the separate attention kernel only)
++template <int T, bool DBG, int AWN = AW, int U = 1>
++__device__ void attn_task(const Params &p, const Layer &Ly, int L, int h, int c, int nchunks, float *sm, const float2 *cs,
++                          const KvView kv) {
++    constexpr int d = 64 * T;
++    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
++    const int n_kv = Ly.n_kv, g = NH / n_kv, kvh = h / g, n = kv.n, cell = kv.dst;   // cell: where the new row goes
++    const int chunk = (n + nchunks - 1) / nchunks;
++    const int j0 = c * chunk, j1 = min(n, j0 + chunk);
++    const size_t row_el = (size_t)n_kv * d;
++    const int qd = NH * d, kd = n_kv * d;
++    float *qs = sm + AWN * (d + 2);             // the normed, roped q head, shared by the block's warps
++    __half *kn = (__half *)(qs + d), *vn = kn + d;  // the new position's K and V as cached (float16)
++    if (w == 0) {
++        float2 q[T];
++        load_head<T>(p.qkv + h * d, q);
++        if (DBG) {   // recorded by chunk 0's block of the head
++            dbg_head<T>(p, WP_QCUR, L, h * d, q, c == 0);
++            head_norm<T>(q, Ly.q_norm, p.eps);
++            dbg_head<T>(p, WP_QCUR_NORMED, L, h * d, q, c == 0);
++            head_rope<T>(q, cs);
++            dbg_head<T>(p, WP_QCUR_POS, L, h * d, q, c == 0);
++        } else
++            norm_rope<T>(q, Ly.q_norm, cs, p.eps);
++#pragma unroll
++        for (int t = 0; t < T; t++) *(float2 *)(qs + 64 * t + 2 * lane) = q[t];
++    }
++    if (w == 1 && cell >= j0 && cell < j1) {  // the new row: K normed + roped, then V normed (full layers: from K before its norm)
++        for (int which = 0; which < 2; which++) {   // one at a time: fewer live registers
++            float2 v[T];
++            if (which == 0) {
++                load_head<T>(p.qkv + qd + kvh * d, v);
++                norm_rope<T>(v, Ly.k_norm, cs, p.eps);
++            } else {
++                load_head<T>(Ly.full ? p.qkv + qd + kvh * d : p.qkv + qd + kd + kvh * d, v);
++                norm_rope<T>(v, nullptr, nullptr, p.eps);
++            }
++            if (DBG) dbg_head<T>(p, which ? WP_VCUR_NORMED : WP_KCUR_POS, L, kvh * d, v, h % g == 0);
++            __half *dst = which ? vn : kn, *cache = which ? Ly.vc : Ly.kc;
++#pragma unroll
++            for (int t = 0; t < T; t++) {
++                int e = 64 * t + 2 * lane;
++                __half2 hv = __floats2half2_rn(v[t].x, v[t].y);
++                *(__half2 *)(dst + e) = hv;
++                if (h % g == 0) *(__half2 *)(cache + (size_t)cell * row_el + kvh * d + e) = hv;
++            }
++        }
++    }
++    __syncthreads();
++    float m = -INFINITY, l = 0.f;
++    float2 acc[T];
++#pragma unroll
++    for (int t = 0; t < T; t++) acc[t] = make_float2(0.f, 0.f);
++    if (U > 1) {   // U positions per iteration (j, j + AWN, ...): their K / V loads and warp reductions overlap
++        float2 qv[T];
++#pragma unroll
++        for (int t = 0; t < T; t++) qv[t] = *(const float2 *)(qs + 64 * t + 2 * lane);
++        for (int j = j0 + w; w < AWN && j < j1; j += AWN * U) {
++            __half2 kh[U][T], vh[U][T];
++            bool ok[U];
++            // loads first, all of them in flight together; the mask (-inf: skip) is applied when they are in: a mask
++            // check before the loads put a dependent memory round trip in front of every position
++#pragma unroll
++            for (int u = 0; u < U; u++) {
++                const int jj = j + u * AWN, js = jj < j1 ? jj : j;
++                const __half *kr = js == cell ? kn : Ly.kc + (size_t)js * row_el + kvh * d;
++                const __half *vr = js == cell ? vn : Ly.vc + (size_t)js * row_el + kvh * d;
++                const float mv = kv.mask ? __half2float(kv.mask[js]) : 0.f;
++#pragma unroll
++                for (int t = 0; t < T; t++) { kh[u][t] = *(const __half2 *)(kr + 64 * t + 2 * lane); vh[u][t] = *(const __half2 *)(vr + 64 * t + 2 * lane); }
++                ok[u] = jj < j1 && mv != -INFINITY;
++#pragma unroll
++                for (int t = 0; t < T; t++)   // a skipped row may hold anything (an empty cell): zeros, not 0 x NaN
++                    if (!ok[u]) { kh[u][t] = __floats2half2_rn(0.f, 0.f); vh[u][t] = kh[u][t]; }
++            }
++            float sd[U];
++#pragma unroll
++            for (int u = 0; u < U; u++) {
++                sd[u] = 0.f;
++#pragma unroll
++                for (int t = 0; t < T; t++) { const float2 kk = __half22float2(kh[u][t]); sd[u] += qv[t].x * kk.x + qv[t].y * kk.y; }
++            }
++#pragma unroll
++            for (int o = 16; o > 0; o >>= 1)
++#pragma unroll
++                for (int u = 0; u < U; u++) sd[u] += __shfl_xor_sync(0xffffffff, sd[u], o);
++            float mn = m;
++#pragma unroll
++            for (int u = 0; u < U; u++) if (ok[u]) mn = fmaxf(mn, sd[u]);
++            if (mn == -INFINITY) continue;   // nothing valid yet
++            const float sc = expf(m - mn);
++            float pj[U], ps = 0.f;
++#pragma unroll
++            for (int u = 0; u < U; u++) { pj[u] = ok[u] ? expf(sd[u] - mn) : 0.f; ps += pj[u]; }
++            l = l * sc + ps;
++#pragma unroll
++            for (int t = 0; t < T; t++) {
++                float ax = acc[t].x * sc, ay = acc[t].y * sc;
++#pragma unroll
++                for (int u = 0; u < U; u++) { const float2 vv = __half22float2(vh[u][t]); ax += pj[u] * vv.x; ay += pj[u] * vv.y; }
++                acc[t] = make_float2(ax, ay);
++            }
++            m = mn;
++        }
++    } else
++    for (int j = j0 + w; w < AWN && j < j1; j += AWN) {
++        const __half *kr = j == cell ? kn : Ly.kc + (size_t)j * row_el + kvh * d;
++        const __half *vr = j == cell ? vn : Ly.vc + (size_t)j * row_el + kvh * d;
++#if PK_ATT_PRELOAD   // the K row's loads in flight with the mask's (see the U > 1 loop), not after it
++        __half2 kh[T];
++#pragma unroll
++        for (int t = 0; t < T; t++) kh[t] = *(const __half2 *)(kr + 64 * t + 2 * lane);
++        if (kv.mask && __half2float(kv.mask[j]) == -INFINITY) continue;   // empty, other sequence or outside the window
++#else
++        if (kv.mask && __half2float(kv.mask[j]) == -INFINITY) continue;   // empty, other sequence or outside the window
++#endif
++        float sdot = 0.f;
++#pragma unroll
++        for (int t = 0; t < T; t++) {
++            int e = 64 * t + 2 * lane;
++#if PK_ATT_PRELOAD
++            float2 kk = __half22float2(kh[t]), qv = *(const float2 *)(qs + e);
++#else
++            float2 kk = __half22float2(*(const __half2 *)(kr + e)), qv = *(const float2 *)(qs + e);
++#endif
++            sdot += qv.x * kk.x + qv.y * kk.y;
++        }
++        sdot = warp_sum(sdot);
++        float mn = fmaxf(m, sdot), sc = expf(m - mn), pj = expf(sdot - mn);
++        l = l * sc + pj;
++#pragma unroll
++        for (int t = 0; t < T; t++) {
++            float2 vv = __half22float2(*(const __half2 *)(vr + 64 * t + 2 * lane));
++            acc[t].x = acc[t].x * sc + pj * vv.x; acc[t].y = acc[t].y * sc + pj * vv.y;
++        }
++        m = mn;
++    }
++    // one position per warp iteration here: several need registers past the 80 cap and spill (attn_kernel does 2)
++    // combine the working warps of this block: sm = [AWN][d + 2]
++    if (w < AWN) {
++        float *my = sm + w * (d + 2);
++        if (lane == 0) { my[0] = m; my[1] = l; }
++#pragma unroll
++        for (int t = 0; t < T; t++) { int e = 64 * t + 2 * lane; my[2 + e] = acc[t].x; my[3 + e] = acc[t].y; }
++    }
++    __syncthreads();
++    float M = -INFINITY;
++    for (int ww = 0; ww < AWN; ww++) M = fmaxf(M, sm[ww * (d + 2)]);
++    const int stride = d + 2;
++    float *pp = p.part + ((size_t)h * nchunks + c) * stride;
++    for (int i = threadIdx.x; i < d; i += blockDim.x) {
++        float a = 0.f;
++        for (int ww = 0; ww < AWN; ww++) { float mw = sm[ww * (d + 2)]; if (mw > -INFINITY) a += sm[ww * (d + 2) + 2 + i] * expf(mw - M); }
++        pp[2 + i] = a;
++    }
++    if (threadIdx.x == 0) {
++        float ls = 0.f;
++        for (int ww = 0; ww < AWN; ww++) { float mw = sm[ww * (d + 2)]; if (mw > -INFINITY) ls += sm[ww * (d + 2) + 1] * expf(mw - M); }
++        pp[0] = M; pp[1] = ls;
++    }
++    __threadfence();
++    __syncthreads();
++    __shared__ unsigned prev;
++    if (threadIdx.x == 0) prev = atomicAdd(p.head_count + h, 1u);
++    __syncthreads();
++    if (prev == (unsigned)nchunks - 1) {  // last chunk of head h: merge the chunks, quantize the head's output
++        __threadfence();
++        attn_merge<DBG>(p, L, h, nchunks, d, sm);
++        if (threadIdx.x == 0) p.head_count[h] = 0;
++    }
++    __syncthreads();
++}
++
++// ------------------------------------------------------------------ routing (P4)
++template <bool DBG>
++__device__ void topk_warp(const Params &p, const Layer &Ly, int L, int ep) {
++    const int lane = threadIdx.x & 31;
++    float lg[4], mx = -INFINITY;
++    for (int k = 0; k < 4; k++) {
++        float a = 0.f;
++        for (int part = 0; part < R_PARTS; part++) a += __ldcg(p.logits + part * NE + lane + 32 * k);
++        lg[k] = a;
++    }
++    if (DBG) {
++        float rms = 0.f;
++        if (dbg_injecting(p, WP_MOE_LOGITS, L)) rms = sqrtf(warp_sum(lg[0] * lg[0] + lg[1] * lg[1] + lg[2] * lg[2] + lg[3] * lg[3]) / NE);
++        for (int k = 0; k < 4; k++) lg[k] = dbg_hook(p, WP_MOE_LOGITS, L, lane + 32 * k, lg[k], rms, true);
++    }
++    for (int k = 0; k < 4; k++) mx = fmaxf(mx, lg[k]);
++    mx = warp_max(mx);
++    float pr[4], s = 0.f;
++    for (int k = 0; k < 4; k++) { pr[k] = expf(lg[k] - mx); s += pr[k]; }
++    s = warp_sum(s);
++    float tot = 0.f, my_w = 0.f; int my_id = 0;
++    for (int sel = 0; sel < NEU; sel++) {
++        float best = -1.f; int bi = 0;
++        for (int k = 0; k < 4; k++) if (pr[k] > best) { best = pr[k]; bi = lane + 32 * k; }
++        for (int o = 16; o > 0; o >>= 1) {
++            float ob = __shfl_xor_sync(0xffffffff, best, o); int oi = __shfl_xor_sync(0xffffffff, bi, o);
++            if (ob > best || (ob == best && oi < bi)) { best = ob; bi = oi; }
++        }
++        if (lane == sel) { my_id = bi; my_w = best / s; }
++#pragma unroll
++        for (int k = 0; k < 4; k++) if (bi == lane + 32 * k) pr[k] = -2.f;   // constant index: stays in registers
++        tot += best / s;
++    }
++    if (lane < NEU) { p.topk_ids[lane] = my_id; p.topk_sc[lane] = my_w / tot * Ly.down_scale[my_id]; }
++    if (DBG && lane < NEU) ((int *)p.dbg.rec)[(size_t)L * WP_SLOT + wp_off(WP_MOE_TOPK) + lane] = my_id;
++    __threadfence();
++    __syncwarp();
++    if (lane == 0) { *p.router_count = 0; __threadfence(); atomicExch(p.topk_flag, ep * 32 + L); }
++}
++__device__ bool wait_topk(const Params &p, int L, int ep) {
++    volatile int *f = p.topk_flag;
++    long long t0 = clock64();
++    while (*f != ep * 32 + L) {
++        __nanosleep(200);
++        if (clock64() - t0 > (1ll << 34)) { atomicExch(p.error, 2); return false; }
++    }
++    __threadfence();
++    return true;
++}
++
++// ------------------------------------------------------------------ partial-unit row phases
++// unit u of a matrix with `rows` rows split into `parts` parts of nb / parts blocks: row u % rows, part u / rows
++// (rows first, so neighbouring warps stream neighbouring rows).
++
++// P1 units: Q, K (, V) rows x QKV_PARTS
++__device__ __forceinline__ void p1_unit(const Layer &Ly, int u, int qd, int kd, int total, const Q4m *&m, int &row, int &part) {
++    part = u / total; int r = u % total; row = r;
++    if (r < qd) { m = &Ly.wq; }
++    else if ((r -= qd) < kd) { m = &Ly.wk; row = r; }
++    else { m = &Ly.wv; row = r - kd; }
++}
++// ------------------------------------------------------------------ the kernel
++#ifndef PK_MINB
++#define PK_MINB 1   // -DPK_MINB=2: two blocks per SM where shared memory allows (H100), at most 64 registers
++#endif
++// DBG: the debug hooks (p.dbg); step<false> is the release kernel
++template <bool DBG>
++__global__ void __launch_bounds__(THREADS, PK_MINB) step(Params p) {
++    extern __shared__ float smem[];
++    // shared layout (floats): x[D] ao[D] vec[VEC], then quantized buffers; attention scratch reuses vec (+ qa)
++    float *x = smem, *ao = x + D, *vec = ao + D;
++    BlockQ8 *qa = (BlockQ8 *)(vec + VEC);                   // up to 256 groups (8192 values)
++    BlockQ8 *qb = qa + 256;                                 // 88 groups (MoE input, kept P4 -> P5)
++    BlockQ8 *qc = qb + 88;                                  // 176 groups (8 x 704 expert inputs)
++    __shared__ int ids_s[NEU];
++    __shared__ float wts_s[NEU], sc_s[NEU];
++    const float eps = p.eps;
++    const int lane = threadIdx.x & 31, tid = threadIdx.x;
++
++    // layer L0's input, normed and quantized below; later layers get x from the previous layer's tail
++    if (p.lm_on && blockIdx.x == 0 && tid == 0) *p.argmax = 0ull;   // read by others only after this layer's barriers
++    __shared__ int ep_s;   // this launch's epoch (read here, before the first barrier; advanced after the last)
++    if (tid == 0) ep_s = p.epoch_dev ? *(volatile int *)p.epoch_dev : p.epoch;
++    __shared__ float2 cs_full[256], cs_swa[128];
++    rope_tables(p, cs_full, cs_swa);
++    if (p.tok_embd && p.L0 == 0 && !p.resume) {   // Q6_K row of the token, dequantized as stock's get_rows does, times sqrt(n_embd)
++        const int tok = p.token_ptr ? *p.token_ptr : p.token;
++        const uint8_t *row = p.tok_embd + (size_t)tok * (D / 256) * 210;
++        for (int i = tid; i < D; i += THREADS) {
++            const uint8_t *b = row + (i / 256) * 210;
++            const int r = i % 256, n = r / 128, k = r % 128, l = k % 32, q = k / 32, is = l / 16;
++            const uint8_t *ql = b + 64 * n, *qh = b + 128 + 32 * n;
++            const int8_t *sc = (const int8_t *)(b + 192) + 8 * n;
++            const int lo = q & 1 ? ql[l + 32] : ql[l], hs = 2 * q;
++            const int v = ((q < 2 ? lo & 0xF : lo >> 4) | (((qh[l] >> hs) & 3) << 4)) - 32;
++            const float dd = __half2float(*(const __half *)(b + 208));
++            x[i] = dd * sc[is + 2 * q] * (float)v * p.embd_scale;
++        }
++    } else
++        for (int i = tid; i < D; i += THREADS) x[i] = p.x_in[i];
++    __syncthreads();
++    const int ep = ep_s;
++    for (int L = p.L0; L < p.L1; L++) {
++        // this layer's descriptor in shared memory: every phase reads its pointers without a global round trip
++        __shared__ Layer Ls;
++        static_assert(sizeof(Layer) % 4 == 0, "Layer copy");
++        for (int i = tid; i < (int)(sizeof(Layer) / 4); i += THREADS) ((int *)&Ls)[i] = ((const int *)&p.layers[L])[i];
++        __syncthreads();
++        const Layer &Ly = Ls;
++        const int d = Ly.dk, qd = NH * d, kd = Ly.n_kv * d;
++        const KvView kv = kv_view(p, Ly);
++        const int n = kv.n;
++        int stage = 0;
++        stamp(p, L, 0);
++        // split attention (launch_layers): a launch may stop after P1 of its last layer, and the next one resume at P3
++        if (p.resume && L == p.L0) stage = 2;
++        else {
++        // ---- P1 prologue: h = rms(x) * attn_norm, quantized
++        {
++            float xv[E], wv[E], ss = 0.f;
++#pragma unroll
++            for (int j = 0; j < E; j++) { int i = tid + j * THREADS; xv[j] = i < D ? x[i] : 0.f; wv[j] = i < D ? __ldg(Ly.attn_norm + i) : 0.f; ss += xv[j] * xv[j]; }
++            float r = rsqrtf(blk_sum2(ss, 0.f).x / D + eps);
++#pragma unroll
++            for (int j = 0; j < E; j++) { int i = tid + j * THREADS; if (i < D) vec[i] = xv[j] * r * wv[j]; }
++            __syncthreads();
++            blk_quantize(vec, qa, D);
++        }
++        pstamp(p, L, 0);
++        // ---- P1: Q, K, V half rows
++        {
++            const int total = qd + kd + (Ly.full ? 0 : kd), nb = D / 32;
++            run_units(0, total * QKV_PARTS, p.stock,
++                [&](int u, Unit &un) { const Q4m *m; int row, part; p1_unit(Ly, u, qd, kd, total, m, row, part);
++                                       const int2 r = prange(nb, QKV_PARTS, part, wtype_group(m->type));
++                                       un = Unit{*m, (size_t)row * nb + r.x, qa + r.x, r.y}; },
++                [&](int u, float v) { if (lane == 0) p.qkv[(u / total) * QKV_MAX + (u % total)] = v; });
++        }
++        if (!grid_barrier(p, L, stage)) return;
++        stamp(p, L, ++stage);
++        if (p.stop_p1 && L == p.L1 - 1) {   // P2 runs in attn_kernel; the next launch resumes at P3 from x_save
++            if (blockIdx.x == 0) for (int i = tid; i < D; i += THREADS) p.x_save[i] = x[i];
++            break;
++        }
++        pstamp(p, L, 1);
++        // ---- P2: attention, at most one task per block: NH heads x nch chunks
++        {
++            const int nch = max(1, min((int)gridDim.x / NH, (n + 31) / 32));
++            for (int t = blockIdx.x; t < NH * nch; t += gridDim.x) {
++                if (Ly.full) attn_task<8, DBG>(p, Ly, L, t / nch, t % nch, nch, vec, cs_full, kv);
++                else attn_task<4, DBG>(p, Ly, L, t / nch, t % nch, nch, vec, cs_swa, kv);
++            }
++        }
++        if (!grid_barrier(p, L, stage)) return;
++        stamp(p, L, ++stage);
++        }
++        // ---- P3 prologue: copy the quantized attention output
++        {
++            const int ng = qd / 32;
++            int *dst = (int *)qa; const int *src = (const int *)p.attq;
++            for (int i = tid; i < ng * (int)(sizeof(BlockQ8) / 4); i += THREADS) dst[i] = __ldcg(src + i);
++            __syncthreads();
++        }
++        pstamp(p, L, 2);
++        // ---- P3: Wo rows (whole rows by default: p.wo_parts)
++        {
++            const int nb = qd / 32;
++            run_units(0, D * p.wo_parts, p.stock,
++                [&](int u, Unit &un) { int row = u % D, part = u / D;
++                                       const int2 r = prange(nb, p.wo_parts, part, wtype_group(Ly.wo.type));
++                                       un = Unit{Ly.wo, (size_t)row * nb + r.x, qa + r.x, r.y}; },
++                [&](int u, float v) { if (lane == 0) p.o[u] = v; });
++            // L2 prefetch for P5: dense down rows; for the P4 prologue: its norm vectors (the one prefetch site that paid,
++            // slightly; the others tried competed with demand loads)
++            for (int r = warp_global(); r < D; r += warps_total()) pf_blocks(Ly.down, (size_t)r * (FF / 32), FF / 32);
++            if (warp_global() < 4) pf_bytes((warp_global() == 0 ? Ly.post_attn : warp_global() == 1 ? Ly.pre2 :
++                                            warp_global() == 2 ? Ly.ffn_norm : Ly.router_scale), D * 4);
++        }
++        if (!grid_barrier(p, L, stage)) return;
++        stamp(p, L, ++stage);
++        // ---- P4 prologue: attn_out = rms(o) * post_attention_norm + x; MoE, FFN and router inputs
++        {
++            float ov[E], aw[E], w1[E], w2[E], w3[E], ss = 0.f;
++#pragma unroll
++            for (int j = 0; j < E; j++) {
++                int i = tid + j * THREADS;
++                if (i < D) {   // all loads first (no runtime loop in between), so they are in flight together
++                    ov[j] = __ldcg(p.o + i);
++                    aw[j] = __ldg(Ly.post_attn + i); w1[j] = __ldg(Ly.pre2 + i); w2[j] = __ldg(Ly.ffn_norm + i);
++                    w3[j] = __ldg(Ly.router_scale + i);
++                } else ov[j] = aw[j] = w1[j] = w2[j] = w3[j] = 0.f;
++            }
++            if (p.wo_parts > 1)
++#pragma unroll
++                for (int j = 0; j < E; j++) {
++                    int i = tid + j * THREADS;
++                    if (i < D) for (int k = 1; k < p.wo_parts; k++) ov[j] += __ldcg(p.o + k * D + i);
++                }
++#pragma unroll
++            for (int j = 0; j < E; j++) ss += ov[j] * ov[j];
++            sstamp(p, L, 0);
++            float r1, r2, ss2 = 0.f, av[E];
++            r1 = rsqrtf(blk_sum2(ss, 0.f).x / D + eps);
++            sstamp(p, L, 1);
++#pragma unroll
++            for (int j = 0; j < E; j++) {
++                int i = tid + j * THREADS;
++                av[j] = i < D ? ov[j] * r1 * aw[j] + x[i] : 0.f;
++            }
++            if (DBG) dbg_vec(p, WP_ATTN_OUT, L, av);
++#pragma unroll
++            for (int j = 0; j < E; j++) ss2 += av[j] * av[j];
++            r2 = rsqrtf(blk_sum2(ss2, 0.f).x / D + eps);
++            const float rs = r2 * rsqrtf((float)D);
++            sstamp(p, L, 2);
++#pragma unroll
++            for (int j = 0; j < E; j++) {
++                int i = tid + j * THREADS;
++                if (i < D) { ao[i] = av[j]; vec[i] = av[j] * r2 * w1[j]; vec[D + i] = av[j] * r2 * w2[j]; vec[2 * D + i] = av[j] * rs * w3[j]; }
++            }
++            __syncthreads();
++            sstamp(p, L, 3);
++            blk_quantize(vec, qb, D);            // MoE input (used in P5)
++            sstamp(p, L, 4);
++            blk_quantize(vec + D, qa, D);        // dense FFN input
++            sstamp(p, L, 5);
++        }
++        pstamp(p, L, 3);
++        // ---- P4: router eighth rows (float32) first, then dense gate / up half rows, then the chosen experts'
++        //      gate_up rows; the warp finishing the last router unit computes the top-8 (no barrier needed)
++        {
++            const int nb = D / 32, rpart = D / R_PARTS;
++            const int n_r = NE * R_PARTS, n_gu = 2 * FF * GU_PARTS, n_e = NEU * 2 * FFE;
++            const size_t estride = (size_t)2 * FFE * nb;
++            const float *rin = vec + 2 * D;
++            for (int u = warp_global(); u < n_r; u += warps_total()) {
++                int row = u % NE, part = u / NE;
++                const float4 *wr = (const float4 *)(Ly.router + (size_t)row * D + part * rpart);
++                const float4 *xv = (const float4 *)(rin + part * rpart);
++                float a = 0.f;
++                for (int i = lane; i < rpart / 4; i += 32) {
++                    float4 wv = __ldg(wr + i), xx = xv[i];
++                    a += wv.x * xx.x + wv.y * xx.y + wv.z * xx.z + wv.w * xx.w;
++                }
++                float v = warp_sum(a);
++                unsigned c = 0;
++                if (lane == 0) { p.logits[part * NE + row] = v; __threadfence(); c = atomicAdd(p.router_count, 1u); }
++                c = __shfl_sync(0xffffffff, c, 0);
++                if (c == (unsigned)n_r - 1) topk_warp<DBG>(p, Ly, L, ep);
++            }
++            run_units(n_r, n_r + n_gu, p.stock,
++                [&](int u, Unit &un) { int w = u - n_r, row = w % (2 * FF), part = w / (2 * FF);
++                                       const Q4m &m = row < FF ? Ly.gate : Ly.up;
++                                       const int2 r = prange(nb, GU_PARTS, part, wtype_group(m.type));
++                                       un = Unit{m, (size_t)(row % FF) * nb + r.x, qa + r.x, r.y}; },
++                [&](int u, float v) { int w = u - n_r, row = w % (2 * FF), part = w / (2 * FF);
++                                      if (lane == 0) (row < FF ? p.g : p.u)[part * FF + row % FF] = v; });
++            if (!wait_topk(p, L, ep)) return;
++            run_units(n_r + n_gu, n_r + n_gu + n_e, p.stock,
++                [&](int u, Unit &un) { int rr = u - n_r - n_gu, slot = rr / (2 * FFE), row = rr % (2 * FFE);
++                                       un = Unit{Ly.gu_exps, __ldcg(p.topk_ids + slot) * estride + (size_t)row * nb, qb, nb}; },
++                [&](int u, float v) { if (lane == 0) p.gu[u - n_r - n_gu] = v; });
++        }
++        if (!grid_barrier(p, L, stage)) return;
++        stamp(p, L, ++stage);
++        // ---- P5 prologue: routing into shared memory; gelu(g) * u and the experts' gelu(gate) * up, quantized
++        {
++            sstamp(p, L, 6);
++            if (tid < NEU) { ids_s[tid] = __ldcg(p.topk_ids + tid); sc_s[tid] = __ldcg(p.topk_sc + tid); }
++            for (int i = tid; i < FF + NEU * FFE; i += THREADS) {
++                if (i < FF) {
++                    float gg = __ldcg(p.g + i), uu = __ldcg(p.u + i);
++#pragma unroll
++                    for (int k = 1; k < GU_PARTS; k++) { gg += __ldcg(p.g + k * FF + i); uu += __ldcg(p.u + k * FF + i); }
++                    vec[i] = gelu_tanh(gg) * uu;
++                } else {
++                    int k = (i - FF) / FFE, j = (i - FF) % FFE;
++                    vec[FF + (i - FF)] = gelu_tanh(__ldcg(p.gu + k * 2 * FFE + j)) * __ldcg(p.gu + k * 2 * FFE + FFE + j);
++                }
++            }
++            __syncthreads();
++            sstamp(p, L, 7);
++            blk_quantize(vec, qa, FF);
++            sstamp(p, L, 8);
++            blk_quantize(vec + FF, qc, NEU * FFE);
++            sstamp(p, L, 9);
++        }
++        pstamp(p, L, 4);
++        // ---- P5: dense down rows (one per warp) and expert down rows: unit r = row r of all 8 chosen experts, each
++        //      scaled by its routing weight x down scale and summed in fixed order in the warp, so the tail reads one
++        //      MoE vector (one unit per (expert, row) was 1.6-2% slower: the tail read 8 partials)
++        {
++            const int nbD = FF / 32, nb6 = FFE / 32;
++            const size_t estride = (size_t)D * nb6;
++            run_units(0, D, p.stock,
++                [&](int u, Unit &un) { un = Unit{Ly.down, (size_t)u * nbD, qa, nbD}; },
++                [&](int u, float v) { if (lane == 0) p.down[u] = v; });
++            const int W = warps_total();
++            int u = warp_global();
++            if (u < D) u += ((D - u + W - 1) / W) * W;
++            for (; u < 2 * D; u += W) {
++                const int r = u - D;
++                float acc = 0.f;
++                for (int it = lane; it < NEU * nb6; it += 32) {
++                    const int k = it / nb6, g = it % nb6;
++                    acc += sc_s[k] * blk_dot(Ly.down_exps, ids_s[k] * estride + (size_t)r * nb6 + g, qc[k * nb6 + g], p.stock);
++                }
++                acc = warp_sum(acc);
++                if (lane == 0) p.moe[r] = acc;
++            }
++        }
++        if (!grid_barrier(p, L, stage)) return;
++        stamp(p, L, ++stage);
++        // ---- tail: l_out = scale * (attn_out + rms(rms(down) * post1 + rms(moe) * post2) * post_ffw_norm)
++        {
++            float dv[E], mv[E], w1[E], w2[E], w3[E], sd = 0.f, sm = 0.f;
++#pragma unroll
++            for (int j = 0; j < E; j++) {
++                int i = tid + j * THREADS;
++                if (i < D) {
++                    dv[j] = __ldcg(p.down + i);
++                    mv[j] = __ldcg(p.moe + i);
++                    w1[j] = __ldg(Ly.post1 + i); w2[j] = __ldg(Ly.post2 + i); w3[j] = __ldg(Ly.post_ffw + i);
++                } else dv[j] = mv[j] = w1[j] = w2[j] = w3[j] = 0.f;
++                sd += dv[j] * dv[j]; sm += mv[j] * mv[j];
++            }
++            sstamp(p, L, 10);
++            float rd, rm, rf, ss = 0.f;
++            float2 s2 = blk_sum2(sd, sm);
++            sstamp(p, L, 11);
++            rd = rsqrtf(s2.x / D + eps); rm = rsqrtf(s2.y / D + eps);
++#pragma unroll
++            for (int j = 0; j < E; j++) {
++                int i = tid + j * THREADS;
++                // rounded products (no FMA into the sum below), as stock's separate ffn_mlp / ffn_moe tensors are, and
++                // the same in step<true>, where the hook sits between them
++                dv[j] = __fmul_rn(dv[j], rd * w1[j]); mv[j] = __fmul_rn(mv[j], rm * w2[j]);
++            }
++            if (DBG) { dbg_vec(p, WP_FFN_MLP, L, dv); dbg_vec(p, WP_FFN_MOE, L, mv); }
++#pragma unroll
++            for (int j = 0; j < E; j++) { dv[j] += mv[j]; ss += dv[j] * dv[j]; }
++            rf = rsqrtf(blk_sum2(ss, 0.f).x / D + eps);
++            const float sc = Ly.out_scale[0];
++            sstamp(p, L, 12);
++            float lo[E];
++#pragma unroll
++            for (int j = 0; j < E; j++) { int i = tid + j * THREADS; lo[j] = i < D ? sc * (ao[i] + dv[j] * rf * w3[j]) : 0.f; }
++            if (DBG) dbg_vec(p, WP_L_OUT, L, lo);
++#pragma unroll
++            for (int j = 0; j < E; j++) {
++                int i = tid + j * THREADS;
++                if (i < D) { x[i] = lo[j]; if (blockIdx.x == 0) p.l_out[i] = lo[j]; }
++            }
++            __syncthreads();
++        }
++    }
++    if (p.lm_on) {   // ---- LM head: rms(x) * output_norm, quantized; every warp streams vocabulary rows
++        float xv[E], wv[E], ss = 0.f;
++#pragma unroll
++        for (int j = 0; j < E; j++) { int i = tid + j * THREADS; xv[j] = i < D ? x[i] : 0.f; wv[j] = i < D ? __ldg(p.out_norm + i) : 0.f; ss += xv[j] * xv[j]; }
++        const float r = rsqrtf(blk_sum2(ss, 0.f).x / D + eps);
++#pragma unroll
++        for (int j = 0; j < E; j++) {
++            int i = tid + j * THREADS;
++            if (i < D) { vec[i] = xv[j] * r * wv[j]; if (DBG && blockIdx.x == 0) p.dbg.rec[(size_t)NL * WP_SLOT + i] = vec[i]; }
++        }
++        __syncthreads();
++        blk_quantize(vec, qa, D);
++        unsigned long long best = 0ull;
++        for (int row = warp_global(); row < p.n_vocab; row += warps_total()) {
++            float v = warp_dot_q4(p.lm_head, (size_t)row * (D / 32), qa, D / 32, p.stock);
++            if (p.softcap > 0.f) v = tanhf(v * (1.0f / p.softcap)) * p.softcap;   // as stock: scale, tanh, scale
++            if (p.logits_out && lane == 0) p.logits_out[row] = v;
++            unsigned u = __float_as_uint(v);
++            u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
++            const unsigned long long key = ((unsigned long long)u << 32) | (0xFFFFFFFFull - (unsigned)row);
++            best = key > best ? key : best;
++        }
++        if (lane == 0 && best) atomicMax(p.argmax, best);
++    }
++    // every block read ep_s before layer L0's first barrier; block 0 gets here only after the last one
++    if (p.epoch_dev && blockIdx.x == 0 && tid == 0) atomicAdd(p.epoch_dev, 1);
++}
++
++// Attention alone, for measuring: P2 of layer L as the persistent kernel runs it, on
++// whatever Q / K / V the last step left in p.qkv; same grid and block size, no barriers needed (the merge uses the
++// head counters). Writes the new K / V row and p.attq like the real phase.
++__global__ void __launch_bounds__(THREADS, PK_MINB) attn_only(Params p, int L) {
++    extern __shared__ float smem[];
++    float *vec = smem + 2 * D;
++    __shared__ Layer Ls;
++    for (int i = threadIdx.x; i < (int)(sizeof(Layer) / 4); i += THREADS) ((int *)&Ls)[i] = ((const int *)&p.layers[L])[i];
++    __syncthreads();
++    __shared__ float2 cs_full[256], cs_swa[128];
++    rope_tables(p, cs_full, cs_swa);
++    __syncthreads();
++    const Layer &Ly = Ls;
++    const KvView kv = kv_view(p, Ly);
++    const int n = kv.n;
++    const int nch = max(1, min((int)gridDim.x / NH, (n + 31) / 32));
++    for (int t = blockIdx.x; t < NH * nch; t += gridDim.x) {
++        if (Ly.full) attn_task<8, false>(p, Ly, L, t / nch, t % nch, nch, vec, cs_full, kv);
++        else attn_task<4, false>(p, Ly, L, t / nch, t % nch, nch, vec, cs_swa, kv);
++    }
++}
++
++// shared memory bytes for the kernel
++inline size_t smem_bytes() {
++    static_assert(sizeof(BlockQ8) == 44, "QA_FLOATS assumes 44-byte q8 blocks");
++    static_assert(AW * (MAXD + 2) + 2 * MAXD <= VEC + 256 * sizeof(BlockQ8) / 4, "attention scratch must fit in vec + qa");
++    return (size_t)(2 * D + VEC) * 4 + (256 + 88 + 176) * sizeof(BlockQ8);
++}
++
++// ------------------------------------------------------------------ split attention
++// At long contexts the attention loop is latency-bound and the persistent kernel's 80 registers allow one position per
++// warp iteration; in its own launch (512 threads, up to 128 registers) it takes two (measured: 190 -> 140 us at 32k on
++// H100). launch_layers() then runs a step as: persistent kernel up to P1 of the first full-attention layer,
++// attn_kernel for its P2, the persistent kernel from its P3 to P1 of the next one, ...
++#ifndef PK_ATT_THREADS
++#define PK_ATT_THREADS 512
++#endif
++constexpr int ATT_THREADS = PK_ATT_THREADS, ATT_AW = ATT_THREADS / 32, ATT_U = 2;
++inline size_t att_smem_bytes() { return (size_t)(ATT_AW * (MAXD + 2) + 2 * MAXD) * 4; }
++
++template <bool DBG>
++__global__ void __launch_bounds__(ATT_THREADS) attn_kernel(Params p, int L) {
++    extern __shared__ float smem[];
++    __shared__ Layer Ls;
++    for (int i = threadIdx.x; i < (int)(sizeof(Layer) / 4); i += blockDim.x) ((int *)&Ls)[i] = ((const int *)&p.layers[L])[i];
++    __shared__ float2 cs_full[256], cs_swa[128];
++    rope_tables(p, cs_full, cs_swa);
++    __syncthreads();
++    const Layer &Ly = Ls;
++    const KvView kv = kv_view(p, Ly);
++    const int nch = max(1, min((int)gridDim.x / NH, (kv.n + 31) / 32));
++    for (int t = blockIdx.x; t < NH * nch; t += gridDim.x) {
++        if (Ly.full) attn_task<8, DBG, ATT_AW, ATT_U>(p, Ly, L, t / nch, t % nch, nch, smem, cs_full, kv);
++        else attn_task<4, DBG, ATT_AW, ATT_U>(p, Ly, L, t / nch, t % nch, nch, smem, cs_swa, kv);
++    }
++}
++
++// ------------------------------------------------------------------ tensor-core attention
++// Full-attention layers (d 512, 2 KV heads of 8 query heads each) in their own launch: a block takes one KV head and a
++// chunk of positions for all 8 of its query heads (each K / V row read once, not 8 times), in tiles of 16 positions
++// staged in shared memory by cp.async (double-buffered, rows of skipped cells zero-filled). 4 warps: S = Q K^T with the
++// head dimension split across warps (partials summed in fixed order), online softmax per head in float32, O += P V
++// with the output dimensions split across warps. mma.m16n8k16 (float16 in, float32 accumulate; rows 8-15 of A are
++// zero: 8 heads), Q and P each as two float16 halves (hi + lo), so the core stays close to float32.
++namespace tc {
++__device__ __forceinline__ void mma(float (&c)[4], uint32_t a0, uint32_t a2, uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
++}
++__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void *ptr) {
++    const unsigned a = (unsigned)__cvta_generic_to_shared(ptr);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
++}
++__device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const void *ptr) {
++    const unsigned a = (unsigned)__cvta_generic_to_shared(ptr);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
++}
++__device__ __forceinline__ void cp16(void *dst, const void *src, bool valid) {   // invalid: 16 zero bytes
++    const unsigned a = (unsigned)__cvta_generic_to_shared(dst);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(a), "l"(src), "r"(valid ? 16 : 0));
++}
++__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
++template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" :: "n"(N)); }
++__device__ __forceinline__ uint32_t h2u(__half2 h) { return *(uint32_t *)&h; }
++// (x, y) as float16 hi + lo halves
++__device__ __forceinline__ void split2(float x, float y, uint32_t &hi, uint32_t &lo) {
++    const __half2 h = __floats2half2_rn(x, y);
++    hi = h2u(h); lo = h2u(__floats2half2_rn(x - __low2float(h), y - __high2float(h)));
++}
++}  // namespace tc
++
++constexpr int TC_THREADS = 128, TC_ROW = MAXD + 8;   // smem row stride in halves: 1040 B, ldmatrix conflict-free
++constexpr int TC_MAXCH = 2048;                       // positions per chunk at most (skip flags in shared memory)
++inline size_t tc_smem_bytes() { return (size_t)4 * 16 * TC_ROW * 2 + TC_MAXCH + 4 * 4 * 32 * 4; }
++
++// positions per chunk and chunks per KV head (at most 80 chunks: p.part; at most TC_MAXCH positions; >= 64 positions)
++__host__ __device__ inline int tc_nch(int n, int grid, int nkvh, int &per) {
++    const int want = max(1, min(80, grid / nkvh));
++    per = min(TC_MAXCH, max(64, ((n + want - 1) / want + 15) / 16 * 16));
++    return (n + per - 1) / per;
++}
++
++template <bool DBG>
++__global__ void __launch_bounds__(TC_THREADS) attn_mma_kernel(Params p, int L) {
++    constexpr int T = 8, d = 512, G = 8;
++    extern __shared__ __align__(16) unsigned char sraw[];
++    __half *Kt = (__half *)sraw, *Vt = Kt + 2 * 16 * TC_ROW;          // [2 buffers][16 positions][TC_ROW]
++    unsigned char *ok_s = (unsigned char *)(Vt + 2 * 16 * TC_ROW);    // [TC_MAXCH]: position used
++    float *red = (float *)(ok_s + TC_MAXCH);                          // [4 warps][4][32]: S partials
++    float *qf = (float *)Kt;                                          // before the loop: Q of the 8 heads, [8][512]
++    __shared__ Layer Ls;
++    for (int i = threadIdx.x; i < (int)(sizeof(Layer) / 4); i += blockDim.x) ((int *)&Ls)[i] = ((const int *)&p.layers[L])[i];
++    __shared__ float2 cs_full[256], cs_swa[128];
++    rope_tables(p, cs_full, cs_swa);
++    __syncthreads();
++    const Layer &Ly = Ls;
++    const KvView kv = kv_view(p, Ly);
++    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, r = lane >> 2, cc = (lane & 3) * 2;
++    const int n = kv.n, cell = kv.dst, nkvh = Ly.n_kv, qd = NH * d;
++    const size_t row_el = (size_t)nkvh * d;
++    int per;   // one task per (KV head, chunk)
++    const int nch = tc_nch(n, gridDim.x, nkvh, per);
++    for (int task = blockIdx.x; task < nkvh * nch; task += gridDim.x) {
++        const int kvh = task / nch, c = task % nch, j0 = c * per, j1 = min(n, j0 + per);
++        // Q of the 8 heads (2 per warp): norm, RoPE, hooks as in attn_task
++        for (int hh = 2 * w; hh < 2 * w + 2; hh++) {
++            const int h = kvh * G + hh;
++            float2 q[T];
++            load_head<T>(p.qkv + h * d, q);
++            if (DBG) {
++                dbg_head<T>(p, WP_QCUR, L, h * d, q, c == 0);
++                head_norm<T>(q, Ly.q_norm, p.eps);
++                dbg_head<T>(p, WP_QCUR_NORMED, L, h * d, q, c == 0);
++                head_rope<T>(q, cs_full);
++                dbg_head<T>(p, WP_QCUR_POS, L, h * d, q, c == 0);
++            } else
++                norm_rope<T>(q, Ly.q_norm, cs_full, p.eps);
++#pragma unroll
++            for (int t = 0; t < T; t++) *(float2 *)(qf + hh * d + 64 * t + 2 * lane) = q[t];
++        }
++        if (w == 0 && cell >= j0 && cell < j1) {   // the new row (K normed + roped; V = K before its norm, normed)
++            for (int which = 0; which < 2; which++) {
++                float2 v[T];
++                load_head<T>(p.qkv + qd + kvh * d, v);
++                if (which == 0) norm_rope<T>(v, Ly.k_norm, cs_full, p.eps);
++                else norm_rope<T>(v, nullptr, nullptr, p.eps);
++                if (DBG) dbg_head<T>(p, which ? WP_VCUR_NORMED : WP_KCUR_POS, L, kvh * d, v, true);
++                __half *cache = (which ? Ly.vc : Ly.kc) + (size_t)cell * row_el + kvh * d;
++#pragma unroll
++                for (int t = 0; t < T; t++) *(__half2 *)(cache + 64 * t + 2 * lane) = __floats2half2_rn(v[t].x, v[t].y);
++            }
++            __threadfence();   // the tile loads below read the cache through L2 (cp.async.cg)
++        }
++        for (int i = threadIdx.x; i < j1 - j0; i += blockDim.x)
++            ok_s[i] = !(kv.mask && __half2float(kv.mask[j0 + i]) == -INFINITY);
++        __syncthreads();
++        // this warp's Q fragments (dims 128 w .. 128 w + 127, 8 k-steps), hi and lo
++        uint32_t qh[8][2], ql[8][2];
++#pragma unroll
++        for (int ks = 0; ks < 8; ks++) {
++            const float *qr = qf + r * d + 128 * w + 16 * ks + cc;
++            tc::split2(qr[0], qr[1], qh[ks][0], ql[ks][0]);
++            tc::split2(qr[8], qr[9], qh[ks][1], ql[ks][1]);
++        }
++        __syncthreads();   // qf (in Kt) is overwritten by the tile loads
++        const int ntile = (j1 - j0 + 15) / 16;
++        auto issue = [&](int tl, int buf) {
++            for (int idx = threadIdx.x; idx < 2 * 16 * 64; idx += blockDim.x) {
++                const int which = idx >> 10, row = (idx >> 6) & 15, ch = idx & 63, pos = tl * 16 + row;
++                const bool valid = j0 + pos < j1 && ok_s[pos];
++                const __half *src = (which ? Ly.vc : Ly.kc) + (size_t)(valid ? j0 + pos : 0) * row_el + kvh * d + ch * 8;
++                tc::cp16((which ? Vt : Kt) + (buf * 16 + row) * TC_ROW + ch * 8, src, valid);
++            }
++        };
++        float m_r = -INFINITY, l_r = 0.f;   // head r's running max and sum (the same in the 4 lanes of the row)
++        float o[16][4];
++#pragma unroll
++        for (int nt = 0; nt < 16; nt++) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.f;
++        issue(0, 0);
++        tc::cp_commit();
++        for (int tl = 0; tl < ntile; tl++) {
++            const int buf = tl & 1;
++            if (tl + 1 < ntile) issue(tl + 1, buf ^ 1);
++            tc::cp_commit();
++            tc::cp_wait<1>();
++            __syncthreads();
++            // S partial over this warp's 128 dims: s0 positions 0-7, s1 positions 8-15 (rows: heads)
++            float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
++            const __half *Kb = Kt + buf * 16 * TC_ROW;
++#pragma unroll
++            for (int ks = 0; ks < 8; ks++) {
++                uint32_t b[4];
++                tc::ldsm4(b, Kb + ((lane & 7) + ((lane >> 4) << 3)) * TC_ROW + 128 * w + 16 * ks + ((lane >> 3) & 1) * 8);
++                tc::mma(s0, qh[ks][0], qh[ks][1], b[0], b[1]); tc::mma(s0, ql[ks][0], ql[ks][1], b[0], b[1]);
++                tc::mma(s1, qh[ks][0], qh[ks][1], b[2], b[3]); tc::mma(s1, ql[ks][0], ql[ks][1], b[2], b[3]);
++            }
++            red[(w * 4 + 0) * 32 + lane] = s0[0]; red[(w * 4 + 1) * 32 + lane] = s0[1];
++            red[(w * 4 + 2) * 32 + lane] = s1[0]; red[(w * 4 + 3) * 32 + lane] = s1[1];
++            __syncthreads();
++            float sv[4], mx = -INFINITY;
++#pragma unroll
++            for (int k = 0; k < 4; k++) {
++                sv[k] = red[(0 * 4 + k) * 32 + lane] + red[(1 * 4 + k) * 32 + lane] + red[(2 * 4 + k) * 32 + lane] + red[(3 * 4 + k) * 32 + lane];
++                const int pos = tl * 16 + (k >> 1) * 8 + cc + (k & 1);
++                if (!(j0 + pos < j1 && ok_s[pos])) sv[k] = -INFINITY;
++                mx = fmaxf(mx, sv[k]);
++            }
++            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
++            mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
++            const float mn = fmaxf(m_r, mx), sc = m_r == -INFINITY ? 0.f : expf(m_r - mn);
++            float pv[4], rs = 0.f;
++#pragma unroll
++            for (int k = 0; k < 4; k++) { pv[k] = sv[k] == -INFINITY ? 0.f : expf(sv[k] - mn); rs += pv[k]; }
++            rs += __shfl_xor_sync(0xffffffff, rs, 1);
++            rs += __shfl_xor_sync(0xffffffff, rs, 2);
++            l_r = l_r * sc + rs; m_r = mn;
++#pragma unroll
++            for (int nt = 0; nt < 16; nt++) { o[nt][0] *= sc; o[nt][1] *= sc; }
++            uint32_t ph0, pl0, ph2, pl2;
++            tc::split2(pv[0], pv[1], ph0, pl0);
++            tc::split2(pv[2], pv[3], ph2, pl2);
++            const __half *Vb = Vt + buf * 16 * TC_ROW;
++#pragma unroll
++            for (int q = 0; q < 8; q++) {
++                uint32_t b[4];
++                tc::ldsm4t(b, Vb + ((lane & 7) + ((lane >> 3) & 1) * 8) * TC_ROW + 128 * w + 16 * q + (lane >> 4) * 8);
++                tc::mma(o[2 * q], ph0, ph2, b[0], b[1]); tc::mma(o[2 * q], pl0, pl2, b[0], b[1]);
++                tc::mma(o[2 * q + 1], ph0, ph2, b[2], b[3]); tc::mma(o[2 * q + 1], pl0, pl2, b[2], b[3]);
++            }
++            __syncthreads();   // both buffers' readers done before the next issue overwrites one
++        }
++        // partials of the 8 heads in attn_task's layout; tc_merge_kernel merges them
++        {
++            const int h = kvh * G + r;
++            float *pp = p.part + ((size_t)h * nch + c) * (d + 2);
++#pragma unroll
++            for (int nt = 0; nt < 16; nt++) { const int dim = 128 * w + 8 * nt + cc; pp[2 + dim] = o[nt][0]; pp[3 + dim] = o[nt][1]; }
++            if (w == 0 && (lane & 3) == 0) { pp[0] = m_r; pp[1] = l_r; }
++        }
++        __syncthreads();
++    }
++}
++
++// the chunks' partials merged: block (head, quarter of the head's 512 dims), one dim per thread, the chunk weights
++// exp(m_c - M) / L computed once per block; the slice quantized into p.attq (32-value groups stay within a slice)
++template <bool DBG>
++__global__ void __launch_bounds__(128) tc_merge_kernel(Params p, int L, int nch) {
++    constexpr int d = 512;
++    __shared__ float wts[80];
++    __shared__ float o[128];
++    const int h = blockIdx.x >> 2, slice = blockIdx.x & 3, tid = threadIdx.x, stride = d + 2;
++    const float *ph = p.part + (size_t)h * nch * stride;
++    if (tid < 32) {
++        float M = -INFINITY;
++        for (int c = tid; c < nch; c += 32) M = fmaxf(M, __ldcg(ph + c * stride));
++        M = warp_max(M);
++        float l = 0.f;
++        for (int c = tid; c < nch; c += 32) { const float m = __ldcg(ph + c * stride); wts[c] = m == -INFINITY ? 0.f : expf(m - M); l += __ldcg(ph + c * stride + 1) * wts[c]; }
++        l = warp_sum(l);
++        __syncwarp();
++        for (int c = tid; c < nch; c += 32) wts[c] /= l;
++    }
++    __syncthreads();
++    const int i = slice * 128 + tid;
++    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;   // 4 independent sums (loads in flight), added in fixed order
++    int c = 0;
++    for (; c + 4 <= nch; c += 4) {
++        a0 += __ldcg(ph + (c + 0) * stride + 2 + i) * wts[c + 0]; a1 += __ldcg(ph + (c + 1) * stride + 2 + i) * wts[c + 1];
++        a2 += __ldcg(ph + (c + 2) * stride + 2 + i) * wts[c + 2]; a3 += __ldcg(ph + (c + 3) * stride + 2 + i) * wts[c + 3];
++    }
++    for (; c < nch; c++) a0 += __ldcg(ph + c * stride + 2 + i) * wts[c];
++    float v = (a0 + a1) + (a2 + a3);
++    if (DBG) v = dbg_hook(p, WP_KQV_OUT, L, h * d + i, v, 0.f, true);
++    o[tid] = v;
++    __syncthreads();
++    blk_quantize(o, p.attq + h * (d / 32) + slice * 4, 128);
++}
++
++
++// One step's layers [L0, L1) (P: L0 / L1 / x_in / lm_on as for a single launch): one cooperative launch, or with `split`
++// the sequence above around every full-attention layer. grid: the persistent kernel's (co-resident) grid; att_grid:
++// attn_kernel's. P.x_save must be set for split.
++// tc_grid > 0: the full-attention layers' attention in attn_mma_kernel (tensor cores) instead of attn_kernel.
++// tc_rows: without kv_ext, the full layers' history rows (contiguous cache, standalone tests)
++inline cudaError_t launch_layers(const Params &P, bool split, bool dbg, int grid, int att_grid, cudaStream_t st, int tc_grid = 0,
++                                 int tc_rows = 0) {
++    void *kfn = dbg ? (void *)step<true> : (void *)step<false>;
++    void *afn = tc_grid ? (dbg ? (void *)attn_mma_kernel<true> : (void *)attn_mma_kernel<false>)
++                        : (dbg ? (void *)attn_kernel<true> : (void *)attn_kernel<false>);
++    if (split && tc_grid) {   // p.part holds 80 chunks per head of at most TC_MAXCH positions (163,840 cells): past
++        int per;              // that the one-kernel step, whose in-kernel attention takes any length
++        if (tc_nch(P.kv_ext ? P.nkv_full : tc_rows + 1, tc_grid, 2, per) > 80) split = false;
++    }
++    int a = P.L0;
++    bool resume = false;
++    cudaError_t e = cudaSuccess;
++    for (int L = P.L0; split && L < P.L1; L++) {
++        if (!is_full(L)) continue;
++        Params Q = P;
++        Q.L0 = a; Q.L1 = L + 1; Q.resume = resume; Q.stop_p1 = 1; Q.lm_on = 0;
++        if (resume) Q.x_in = P.x_save;
++        void *args[] = {&Q};
++        if ((e = cudaLaunchCooperativeKernel(kfn, grid, THREADS, args, smem_bytes(), st)) != cudaSuccess) return e;
++        int La = L;
++        void *aargs[] = {&Q, &La};
++        if ((e = tc_grid ? cudaLaunchKernel(afn, tc_grid, TC_THREADS, aargs, tc_smem_bytes(), st)
++                         : cudaLaunchKernel(afn, att_grid, ATT_THREADS, aargs, att_smem_bytes(), st)) != cudaSuccess) return e;
++        if (tc_grid) {   // n: the full layers' cells (kv_ext) or rows + 1
++            int per, nch = tc_nch(P.kv_ext ? P.nkv_full : tc_rows + 1, tc_grid, 2, per);
++            void *margs[] = {&Q, &La, &nch};
++            if ((e = cudaLaunchKernel(dbg ? (void *)tc_merge_kernel<true> : (void *)tc_merge_kernel<false>, NH * 4, 128, margs, 0, st)) != cudaSuccess) return e;
++        }
++        a = L; resume = true;
++    }
++    Params Q = P;
++    Q.L0 = a; Q.resume = resume; Q.stop_p1 = 0;
++    if (resume) Q.x_in = P.x_save;
++    void *args[] = {&Q};
++    return cudaLaunchCooperativeKernel(kfn, grid, THREADS, args, smem_bytes(), st);
++}
++
++}  // namespace pk
+diff --git a/ggml/src/ggml-cuda/megakernel.cu b/ggml/src/ggml-cuda/megakernel.cu
+new file mode 100644
+index 0000000..ef72cfa
+--- /dev/null
++++ b/ggml/src/ggml-cuda/megakernel.cu
+@@ -0,0 +1,350 @@
++// Gemma 4 26B A4B decode megakernel (fork, GGML_CUDA_MEGAKERNEL=1).
++// The kernel itself is megakernel-persistent.cuh (helpers in megakernel-common.cuh); this file maps llama.cpp's
++// tensors onto it and launches it.
++#include "megakernel.cuh"
++#include "ggml-megakernel.h"
++
++#include <cmath>
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <utility>
++#include <vector>
++#include <cstdint>
++#include <cuda_fp16.h>      // before namespace mk: megakernel-common.cuh includes them too, as no-ops
++
++namespace mk {
++#ifndef PK_THREADS
++#define PK_THREADS 768   // 768 threads (80 registers): the measured best on L40S and H100
++#endif
++#include "megakernel-common.cuh"
++#include "megakernel-persistent.cuh"
++}  // namespace mk
++
++static const ggml_megakernel_desc * mk_desc(const ggml_tensor * t) {
++    if (t->op != GGML_OP_CUSTOM) {
++        return nullptr;
++    }
++    const auto * p = (const ggml_custom_op_params *) t->op_params;
++    const auto * d = (const ggml_megakernel_desc *) p->userdata;
++    return d != nullptr && d->magic == GGML_MEGAKERNEL_MAGIC ? d : nullptr;
++}
++
++bool ggml_cuda_megakernel_is_node(const ggml_tensor * t) {
++    return mk_desc(t) != nullptr;
++}
++
++static int mk_wtype(ggml_type t) {
++    switch (t) {
++        case GGML_TYPE_Q4_0: return mk::pk::W_Q4_0;
++        case GGML_TYPE_Q8_0: return mk::pk::W_Q8_0;
++        case GGML_TYPE_Q5_0: return mk::pk::W_Q5_0;
++        case GGML_TYPE_Q4_K: return mk::pk::W_Q4_K;
++        case GGML_TYPE_Q5_K: return mk::pk::W_Q5_K;
++        case GGML_TYPE_Q6_K: return mk::pk::W_Q6_K;
++        default:             return -1;
++    }
++}
++
++bool ggml_cuda_megakernel_supported(const ggml_tensor * t) {
++    const ggml_megakernel_desc * d = mk_desc(t);
++    if (!d) {
++        return false;
++    }
++    if (d->n_layer != mk::NL || d->n_embd != mk::D || d->n_head != mk::NH || t->type != GGML_TYPE_F32 ||
++        t->ne[0] != d->n_vocab || ggml_nrows(t) != 1 || !d->tok_embd || d->tok_embd->type != GGML_TYPE_Q6_K ||
++        !d->output || d->output->type != GGML_TYPE_Q6_K) {
++        return false;
++    }
++    for (int i = 0; i < 9; i++) {
++        if (!t->src[i]) {
++            return false;
++        }
++    }
++    // every tensor the kernel reads directly must be in device memory (all layers offloaded)
++    auto on_device = [](const ggml_tensor * x) { return x == nullptr || (x->buffer && !ggml_backend_buffer_is_host(x->buffer)); };
++    if (!on_device(d->tok_embd) || !on_device(d->output) || !on_device(d->output_norm)) {
++        return false;
++    }
++    if (t->src[2]->type != GGML_TYPE_F16 || t->src[3]->type != GGML_TYPE_F16 ||
++        t->src[4]->type != GGML_TYPE_I64 || t->src[5]->type != GGML_TYPE_I64) {
++        return false;
++    }
++    for (int L = 0; L < mk::NL; L++) {
++        const ggml_megakernel_layer & l = d->layers[L];
++        if (!l.swa && !l.rope_freqs) {   // the kernel's full-attention RoPE divides by rope_freqs
++            return false;
++        }
++        const ggml_tensor * mats[] = { l.wq, l.wk, l.wo, l.ffn_gate, l.ffn_up, l.ffn_down, l.ffn_gate_up_exps, l.ffn_down_exps };
++        for (const ggml_tensor * m : mats) {
++            if (!m || mk_wtype(m->type) < 0) {
++                return false;
++            }
++        }
++        if (l.wv && mk_wtype(l.wv->type) < 0) {
++            return false;
++        }
++        if (!l.k_cache || !l.v_cache || l.k_cache->type != GGML_TYPE_F16 || l.v_cache->type != GGML_TYPE_F16) {
++            return false;
++        }
++        const ggml_tensor * all[] = { l.attn_norm, l.attn_q_norm, l.attn_k_norm, l.attn_post_norm, l.ffn_norm, l.ffn_post_norm_1,
++                                      l.ffn_pre_norm_2, l.ffn_post_norm_2, l.ffn_post_norm, l.out_scale, l.rope_freqs, l.wq, l.wk,
++                                      l.wv, l.wo, l.ffn_gate, l.ffn_up, l.ffn_down, l.ffn_gate_inp, l.ffn_gate_inp_s,
++                                      l.ffn_gate_up_exps, l.ffn_down_exps, l.ffn_down_exps_s, l.k_cache, l.v_cache };
++        for (const ggml_tensor * x : all) {
++            if (!on_device(x)) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++struct mk_state {
++    mk::pk::Params P {};
++    size_t smem = 0;
++    int grid = 0;
++    int tc_grid = 0;           // attn_mma_kernel's grid
++    int split_min = 0;         // full-attention cells from which those layers' attention runs in attn_mma_kernel
++    float * rec = nullptr, * rep = nullptr, * noise = nullptr;   // debug hooks' device buffers (allocated on first use)
++    // what the state was made from: the model's weights (repacked copies) and the cache tensors' data (per layer)
++    const void * weights = nullptr;
++    std::vector<mk::pk::Layer> PL;
++    mk::pk::Layer * dPL = nullptr;
++};
++
++// the weights' identity (the tensors' data; the repacked copies were made from it)
++static const void * mk_weights_key(const ggml_megakernel_desc * d) {
++    return d->output->data;
++}
++
++static std::mutex g_mk_mutex;
++static std::map<std::pair<const void *, int>, mk_state *> g_mk_states;
++
++// ---- debug hooks (ggml-megakernel.h)
++static_assert(GGML_MEGAKERNEL_WATCH_N == mk::pk::WP_N, "watch point list");
++static constexpr size_t MK_DBG_N = (size_t) mk::NL * mk::pk::WP_SLOT + mk::D;
++static bool g_mk_dbg_on = false;
++static ggml_megakernel_debug g_mk_dbg;
++
++size_t ggml_megakernel_debug_watch(int w, int layer, const char ** name, size_t * offset, int64_t * ne0, int64_t * ne1) {
++    if (w < 0 || w > GGML_MEGAKERNEL_WATCH_N || (w < GGML_MEGAKERNEL_WATCH_N && (layer < 0 || layer >= mk::NL))) {
++        return 0;
++    }
++    int a = mk::D, b = 1;
++    if (w < GGML_MEGAKERNEL_WATCH_N) {
++        mk::pk::wp_shape(w, layer, a, b);
++    }
++    if (name)   *name   = w < GGML_MEGAKERNEL_WATCH_N ? mk::pk::wp_name(w) : "result_norm";
++    if (offset) *offset = w < GGML_MEGAKERNEL_WATCH_N ? (size_t) layer * mk::pk::WP_SLOT + mk::pk::wp_off(w) : (size_t) mk::NL * mk::pk::WP_SLOT;
++    if (ne0)    *ne0    = a;
++    if (ne1)    *ne1    = b;
++    return MK_DBG_N;
++}
++
++void ggml_megakernel_debug_set(const ggml_megakernel_debug * d) {
++    std::lock_guard<std::mutex> lock(g_mk_mutex);
++    g_mk_dbg_on = d != nullptr;
++    if (d) {
++        g_mk_dbg = *d;
++    }
++}
++
++template <class T> static T * mk_alloc(size_t n, bool zero = true) {
++    T * p = nullptr;
++    CUDA_CHECK(cudaMalloc(&p, n * sizeof(T)));
++    if (zero) {
++        CUDA_CHECK(cudaMemset(p, 0, n * sizeof(T)));
++    }
++    return p;
++}
++
++// a weight matrix as the kernel addresses it; repacked copies (16-byte-aligned layouts) where they measured faster
++static mk::pk::Q4m mk_q4m(const ggml_tensor * t, bool repack, cudaStream_t st) {
++    mk::pk::Q4m m { (const mk::BlockQ4 *) t->data, nullptr, nullptr };
++    m.type = mk_wtype(t->type);
++    const size_t bytes = ggml_nbytes(t);
++    if (repack && m.type == mk::pk::W_Q4_0) {
++        const size_t nb = bytes / sizeof(mk::BlockQ4);
++        uint4 * qs = mk_alloc<uint4>(nb, false); __half * dd = mk_alloc<__half>(nb, false);
++        mk::k_repack_q4_0<<<(nb + 255) / 256, 256, 0, st>>>((const mk::BlockQ4 *) t->data, qs, dd, nb);
++        m.qs = qs; m.d = dd;
++    } else if (repack && m.type == mk::pk::W_Q8_0) {
++        const size_t nb = bytes / 34;
++        uint4 * qs = mk_alloc<uint4>(2 * nb, false); __half * dd = mk_alloc<__half>(nb, false);
++        mk::k_repack_q8_0<<<(nb + 255) / 256, 256, 0, st>>>((const uint8_t *) t->data, qs, dd, nb);
++        m.qs = qs; m.d = dd;
++    } else if (repack && m.type == mk::pk::W_Q5_0) {
++        const size_t nb = bytes / 22;
++        uint4 * qs = mk_alloc<uint4>(nb, false); uint32_t * qh = mk_alloc<uint32_t>(nb, false); __half * dd = mk_alloc<__half>(nb, false);
++        mk::k_repack_q5_0<<<(nb + 255) / 256, 256, 0, st>>>((const uint8_t *) t->data, qs, qh, dd, nb);
++        m.qs = qs; m.qh = qh; m.d = dd;
++    } else if (m.type == mk::pk::W_Q6_K && t->ne[1] >= 65536) {   // the LM head: always repacked (2x on H100)
++        const size_t nb = bytes / 210;
++        uint4 * ql = mk_alloc<uint4>(8 * nb, false); uint4 * qh = mk_alloc<uint4>(4 * nb, false);
++        uint2 * sc = mk_alloc<uint2>(2 * nb, false); __half * dd = mk_alloc<__half>(nb, false);
++        mk::k_repack_q6_k<<<(nb + 255) / 256, 256, 0, st>>>((const uint8_t *) t->data, ql, qh, sc, dd, nb);
++        m.qs = ql; m.qh = (const uint32_t *) qh; m.sc = sc; m.d = dd;
++    }
++    CUDA_CHECK(cudaGetLastError());
++    return m;
++}
++
++static mk_state * mk_init(const ggml_megakernel_desc * d, int device, cudaStream_t st) {
++    mk_state * s = new mk_state();
++    mk::pk::Params & P = s->P;
++    // repacked Q4_0 / Q8_0 / Q5_0 on Hopper (faster there, no gain measured on Ada); GGML_CUDA_MEGAKERNEL_REPACK=0/1 overrides
++    const int cc = ggml_cuda_info().devices[device].cc;
++    bool repack = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_HOPPER;
++    if (const char * e = getenv("GGML_CUDA_MEGAKERNEL_REPACK")) {
++        repack = atoi(e) != 0;
++    }
++    std::vector<mk::pk::Layer> PL(mk::NL);
++    for (int L = 0; L < mk::NL; L++) {
++        const ggml_megakernel_layer & w = d->layers[L];
++        mk::pk::Layer & l = PL[L];
++        auto f = [](const ggml_tensor * t) { return t ? (const float *) t->data : nullptr; };
++        l.attn_norm = f(w.attn_norm); l.q_norm = f(w.attn_q_norm); l.k_norm = f(w.attn_k_norm); l.post_attn = f(w.attn_post_norm);
++        l.ffn_norm = f(w.ffn_norm); l.post1 = f(w.ffn_post_norm_1); l.pre2 = f(w.ffn_pre_norm_2); l.post2 = f(w.ffn_post_norm_2);
++        l.post_ffw = f(w.ffn_post_norm); l.out_scale = f(w.out_scale);
++        l.router = f(w.ffn_gate_inp); l.router_scale = f(w.ffn_gate_inp_s); l.down_scale = f(w.ffn_down_exps_s);
++        l.wq = mk_q4m(w.wq, repack, st); l.wk = mk_q4m(w.wk, repack, st);
++        l.wv = w.wv ? mk_q4m(w.wv, repack, st) : mk::pk::Q4m { nullptr, nullptr, nullptr };
++        l.wo = mk_q4m(w.wo, repack, st); l.gate = mk_q4m(w.ffn_gate, repack, st); l.up = mk_q4m(w.ffn_up, repack, st);
++        l.down = mk_q4m(w.ffn_down, repack, st); l.gu_exps = mk_q4m(w.ffn_gate_up_exps, repack, st);
++        l.down_exps = mk_q4m(w.ffn_down_exps, repack, st);
++        l.kc = (__half *) w.k_cache->data; l.vc = (__half *) w.v_cache->data; l.rows = 0;
++        l.dk = w.head_dim; l.n_kv = w.n_head_kv; l.full = !w.swa;
++        if (!w.swa && w.rope_freqs) {
++            P.rope_freqs = (const float *) w.rope_freqs->data;
++        }
++    }
++    mk::pk::Layer * dPL = mk_alloc<mk::pk::Layer>(mk::NL, false);
++    CUDA_CHECK(cudaMemcpyAsync(dPL, PL.data(), mk::NL * sizeof(mk::pk::Layer), cudaMemcpyHostToDevice, st));
++    s->weights = mk_weights_key(d); s->PL = PL; s->dPL = dPL;
++    // integer-sum Q4_0 / Q5_0 offset (closer to exact than stock); GGML_CUDA_MEGAKERNEL_ARITH=stock: stock's
++    // arithmetic for those mat-vecs (the correctness gate checks the kernel against stock op by op in this mode)
++    const char * arith = getenv("GGML_CUDA_MEGAKERNEL_ARITH");
++    P.layers = dPL; P.eps = d->eps; P.stock = arith && strcmp(arith, "stock") == 0;
++    P.wo_parts = 1;
++    P.ts_full = powf(d->rope_base_full, -2.0f / 512); P.ts_swa = powf(d->rope_base_swa, -2.0f / 256);
++    P.tok_embd = (const uint8_t *) d->tok_embd->data; P.embd_scale = d->embd_scale;
++    P.lm_head = mk_q4m(d->output, false, st); P.out_norm = (const float *) d->output_norm->data;
++    P.n_vocab = d->n_vocab; P.softcap = d->softcap; P.lm_on = 1;
++    P.kv_ext = 1;
++    using namespace mk;
++    using namespace mk::pk;
++    P.qkv = mk_alloc<float>(QKV_PARTS * QKV_MAX); P.part = mk_alloc<float>((size_t) NH * 80 * 514);
++    P.attq = mk_alloc<BlockQ8>(8192 / 32);
++    P.o = mk_alloc<float>(WO_PARTS * D); P.g = mk_alloc<float>(GU_PARTS * FF); P.u = mk_alloc<float>(GU_PARTS * FF);
++    P.logits = mk_alloc<float>(R_PARTS * NE); P.gu = mk_alloc<float>(NEU * 2 * FFE); P.down = mk_alloc<float>(D);
++    P.moe = mk_alloc<float>(NEU * D); P.l_out = mk_alloc<float>(D);
++    P.bar_count = mk_alloc<unsigned>(1); P.bar_gen = mk_alloc<unsigned>(1); P.head_count = mk_alloc<unsigned>(NH);
++    P.error = mk_alloc<int>(1); P.router_count = mk_alloc<unsigned>(1); P.topk_flag = mk_alloc<int>(1);
++    P.topk_ids = mk_alloc<int>(NEU); P.topk_sc = mk_alloc<float>(NEU);
++    P.argmax = mk_alloc<unsigned long long>(1); P.epoch_dev = mk_alloc<int>(1); P.epoch = 0;
++    // the top-8 flag is matched against epoch * 32 + layer: start it at -1, or the first launch's layer 0 (epoch 0)
++    // would find its value already there and read the expert ids before the router has written them
++    CUDA_CHECK(cudaMemset(P.topk_flag, 0xFF, sizeof(int)));
++    s->smem = smem_bytes();
++    CUDA_CHECK(cudaFuncSetAttribute(step<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) s->smem));
++    CUDA_CHECK(cudaFuncSetAttribute(step<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) s->smem));
++    int per_sm = 0, per_sm_dbg = 0;
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, step<false>, THREADS, s->smem));
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm_dbg, step<true>, THREADS, s->smem));
++    per_sm = std::min(per_sm, per_sm_dbg);   // one grid for both variants
++    // long contexts: the full-attention layers' attention in its own launch on tensor cores; from
++    // GGML_CUDA_MEGAKERNEL_SPLIT cells on (0: always; default by architecture: H100 gains from ~16k, L40S only near 32k)
++    CUDA_CHECK(cudaFuncSetAttribute(attn_mma_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) tc_smem_bytes()));
++    CUDA_CHECK(cudaFuncSetAttribute(attn_mma_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) tc_smem_bytes()));
++    int tc1 = 0, tc2 = 0;
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&tc1, attn_mma_kernel<false>, TC_THREADS, tc_smem_bytes()));
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&tc2, attn_mma_kernel<true>, TC_THREADS, tc_smem_bytes()));
++    s->tc_grid = ggml_cuda_info().devices[device].nsm * std::max(1, std::min(tc1, tc2));
++    s->split_min = cc >= GGML_CUDA_CC_HOPPER ? 12288 : 24576;
++    if (const char * e = getenv("GGML_CUDA_MEGAKERNEL_SPLIT")) {
++        s->split_min = atoi(e);
++    }
++    P.x_save = mk_alloc<float>(D);
++    s->grid = ggml_cuda_info().devices[device].nsm * per_sm;
++    GGML_ASSERT(s->grid > 0 && "megakernel: the persistent kernel does not fit on this device");
++    CUDA_CHECK(cudaStreamSynchronize(st));
++    GGML_LOG_INFO("%s: Gemma 4 decode megakernel: %d SMs x %d blocks, %d threads, %zu B shared, repack %d, %s arithmetic, "
++                  "tensor-core attention from %d cells\n", __func__, ggml_cuda_info().devices[device].nsm, per_sm, THREADS, s->smem,
++                  (int) repack, P.stock ? "stock" : "integer-sum", s->split_min);
++    return s;
++}
++
++void ggml_cuda_megakernel(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_megakernel_desc * d = mk_desc(dst);
++    GGML_ASSERT(d && ggml_cuda_megakernel_supported(dst));
++    cudaStream_t st = ctx.stream();
++    mk_state * s;
++    {
++        std::lock_guard<std::mutex> lock(g_mk_mutex);
++        auto & slot = g_mk_states[{ (const void *) d, ctx.device }];
++        if (slot && slot->weights != mk_weights_key(d)) {   // another model at the same descriptor: start over
++            GGML_LOG_WARN("%s: model changed under a cached megakernel state; rebuilding it (the old one is not freed)\n", __func__);
++            slot = nullptr;
++        }
++        if (!slot) {
++            slot = mk_init(d, ctx.device, st);
++        }
++        s = slot;
++        // a new context can reuse the descriptor (same cache addresses) with other cache memory: follow the cache
++        bool moved = false;
++        for (int L = 0; L < mk::NL; L++) {
++            __half * kc = (__half *) d->layers[L].k_cache->data, * vc = (__half *) d->layers[L].v_cache->data;
++            if (s->PL[L].kc != kc || s->PL[L].vc != vc) {
++                s->PL[L].kc = kc; s->PL[L].vc = vc; moved = true;
++            }
++        }
++        if (moved) {
++            CUDA_CHECK(cudaMemcpyAsync(s->dPL, s->PL.data(), mk::NL * sizeof(mk::pk::Layer), cudaMemcpyHostToDevice, st));
++        }
++    }
++    mk::pk::Params P = s->P;   // the per-step inputs (device copies made by the scheduler)
++    P.token_ptr = (const int *) dst->src[0]->data;
++    P.pos_ptr   = (const int *) dst->src[1]->data;
++    P.mask_full = (const __half *) dst->src[2]->data; P.nkv_full = (int) dst->src[2]->ne[0];
++    P.mask_swa  = (const __half *) dst->src[3]->data; P.nkv_swa  = (int) dst->src[3]->ne[0];
++    P.dst_full  = (const int64_t *) dst->src[4]->data;
++    P.dst_swa   = (const int64_t *) dst->src[5]->data;
++    P.logits_out = (float *) dst->data;
++    P.L0 = 0; P.L1 = mk::NL; P.x_in = nullptr;
++    bool dbg;
++    ggml_megakernel_debug D;
++    {
++        std::lock_guard<std::mutex> lock(g_mk_mutex);
++        dbg = g_mk_dbg_on;
++        D = g_mk_dbg;
++    }
++    if (dbg) {   // the debug variant: records every watch point, replaces the selected ones, plants a fault
++        if (!s->rec) {
++            s->rec = mk_alloc<float>(MK_DBG_N); s->rep = mk_alloc<float>(MK_DBG_N); s->noise = mk_alloc<float>(8192);
++        }
++        bool any = false;
++        for (int L = 0; L < mk::NL; L++) {
++            P.dbg.rep_mask[L] = D.rep_mask[L];
++            any |= D.rep_mask[L] != 0;
++        }
++        GGML_ASSERT((!any || D.rep) && "megakernel debug: replacements without values");
++        if (any) {
++            CUDA_CHECK(cudaMemcpyAsync(s->rep, D.rep, MK_DBG_N * sizeof(float), cudaMemcpyHostToDevice, st));
++        }
++        P.dbg.inj_w = -1;
++        if (D.inj_w >= 0 && D.inj_w < GGML_MEGAKERNEL_WATCH_N && D.noise) {
++            CUDA_CHECK(cudaMemcpyAsync(s->noise, D.noise, mk::pk::wp_size(D.inj_w) * sizeof(float), cudaMemcpyHostToDevice, st));
++            P.dbg.inj_w = D.inj_w; P.dbg.inj_layer = D.inj_layer; P.dbg.inj_scale = D.inj_scale; P.dbg.inj_rel = D.inj_rel;
++        }
++        P.dbg.rec = s->rec; P.dbg.rep = s->rep; P.dbg.noise = s->noise;
++    }
++    const bool split = P.nkv_full >= s->split_min;
++    CUDA_CHECK(mk::pk::launch_layers(P, split, dbg, s->grid, 0, st, s->tc_grid));
++    if (dbg && D.rec) {
++        CUDA_CHECK(cudaMemcpyAsync(D.rec, s->rec, MK_DBG_N * sizeof(float), cudaMemcpyDeviceToHost, st));
++        CUDA_CHECK(cudaStreamSynchronize(st));
++    }
++}
+diff --git a/ggml/src/ggml-cuda/megakernel.cuh b/ggml/src/ggml-cuda/megakernel.cuh
+new file mode 100644
+index 0000000..677aee6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/megakernel.cuh
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include "common.cuh"
++
++// Gemma 4 decode megakernel (fork, GGML_CUDA_MEGAKERNEL=1): see ggml/include/ggml-megakernel.h
++bool ggml_cuda_megakernel_is_node(const ggml_tensor * t);
++bool ggml_cuda_megakernel_supported(const ggml_tensor * t);
++void ggml_cuda_megakernel(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index d883384..6a9042f 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -1,5 +1,43 @@
+ #include "models.h"
+ #include "llama-impl.h"
++#include "llama-kv-cache-iswa.h"
++#include "ggml-megakernel.h"
++
++#include <cmath>
++#include <cstdlib>
++#include <map>
++#include <memory>
++#include <mutex>
++
++// ---- decode megakernel (fork): GGML_CUDA_MEGAKERNEL=1 builds a single-token step as one custom op that the CUDA
++// backend runs as one persistent kernel (see ggml/include/ggml-megakernel.h); anything else builds the usual graph
++
++static bool gemma4_megakernel_enabled() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_CUDA_MEGAKERNEL");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++
++static void gemma4_megakernel_cpu(ggml_tensor *, int, int, void *) {
++    GGML_ABORT("GGML_CUDA_MEGAKERNEL: the decode megakernel runs only on a CUDA device with the whole model offloaded");
++}
++
++// the token ids, without the embedding lookup (the kernel does it)
++class llm_graph_input_mk_tokens : public llm_graph_input_i {
++public:
++    void set_input(const llama_ubatch * ubatch) override {
++        GGML_ASSERT(ubatch->token && "GGML_CUDA_MEGAKERNEL: token input only");
++        ggml_backend_tensor_set(tokens, ubatch->token, 0, ggml_nbytes(tokens));
++    }
++    // reusable while the batch is again token ids of the same count (the default, false, rebuilds the graph and its
++    // allocation every decode step: ~0.15-0.25 ms of host time per token)
++    bool can_reuse(const llm_graph_params & params) override {
++        return params.ubatch.token && tokens && tokens->ne[0] == params.ubatch.n_tokens;
++    }
++    ggml_tensor * tokens = nullptr;
++};
+ 
+ void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
+     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+@@ -159,6 +197,10 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
++    if (gemma4_megakernel_enabled() && build_megakernel()) {
++        return;
++    }
++
+     // do the PLE first to guarantee it is done in the host buffer
+     // ref: https://github.com/ggml-org/llama.cpp/pull/30160
+     ggml_tensor * inp_per_layer = nullptr;
+@@ -534,3 +576,97 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor *
+     inp_per_layer = ggml_cont(ctx0, ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3));
+     return inp_per_layer;
+ }
++
++// GGML_CUDA_MEGAKERNEL=1: the single-token decode step as one custom node (false: not applicable, build the graph)
++bool llama_model_gemma4::graph::build_megakernel() {
++    // !ubatch.token: an input-embeddings batch (e.g. multimodal) takes the usual graph
++    if (!ubatch.token || n_tokens != 1 || n_outputs != 1 || !cparams.flash_attn || cparams.embeddings ||
++        model.per_layer_tok_embd || !model.output || n_layer != GGML_MEGAKERNEL_LAYERS || hparams.n_embd != 2816 ||
++        hparams.f_attention_scale != 1.0f) {
++        return false;
++    }
++    for (int il = 0; il < n_layer; ++il) {
++        const auto & l = model.layers[il];
++        if (!hparams.has_kv(il) || l.wqkv || l.wq_s || l.wk_s || l.wv_s || l.wo_s || l.ffn_gate_s || l.ffn_up_s ||
++            l.ffn_down_s || l.ffn_up_exps_s || l.ffn_gate_exps_s || !l.ffn_gate_up_exps || !l.ffn_gate_inp ||
++            model.get_rope_freq_scale(cparams, il) != 1.0f) {
++            return false;
++        }
++    }
++    const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
++
++    // inputs: token ids, positions, the attention masks and destination cells of both caches
++    auto inp_tok = std::make_unique<llm_graph_input_mk_tokens>();
++    inp_tok->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++    ggml_set_input(inp_tok->tokens);
++    cb(inp_tok->tokens, "inp_tokens", -1);
++    res->t_inp_tokens = inp_tok->tokens;
++    ggml_tensor * tokens = inp_tok->tokens;
++    res->add_input(std::move(inp_tok));
++    ggml_tensor * inp_pos = build_inp_pos();
++    auto * inp_attn = build_attn_inp_kv_iswa();
++
++    // the descriptor: weights and cache tensors, one object per cache (the node's userdata must outlive the graph) and
++    // refilled at every build: a context created after another was freed can get the same tensor addresses, and a
++    // descriptor kept from then would point at the freed context's cache
++    static std::mutex mtx;
++    static std::map<const void *, std::unique_ptr<ggml_megakernel_desc>> descs;
++    ggml_tensor * k0 = mctx_cur->get_swa()->get_k(ctx0, 0);
++    const void * key = k0->view_src ? (const void *) k0->view_src : (const void *) k0;
++    ggml_megakernel_desc * d;
++    {
++        std::lock_guard<std::mutex> lock(mtx);
++        auto & slot = descs[key];
++        if (!slot) {
++            slot = std::make_unique<ggml_megakernel_desc>();
++        }
++        {
++            d = slot.get();
++            d->magic = GGML_MEGAKERNEL_MAGIC;
++            d->n_layer = n_layer; d->n_embd = (int32_t) hparams.n_embd; d->n_head = (int32_t) hparams.n_head(0);
++            d->n_vocab = (int32_t) model.output->ne[1];
++            d->eps = hparams.f_norm_rms_eps; d->softcap = hparams.f_final_logit_softcapping;
++            d->embd_scale = sqrtf((float) hparams.n_embd);
++            // llama.cpp keeps tok_embd in host memory for its get_rows; the tied LM head (model.output) is the same Q6_K
++            // table on the GPU, so the kernel's embedding lookup reads that copy
++            const bool same = model.output && model.tok_embd && model.output->type == model.tok_embd->type &&
++                              ggml_are_same_shape(model.output, model.tok_embd);
++            d->tok_embd = same ? model.output : model.tok_embd; d->output_norm = model.output_norm; d->output = model.output;
++            for (int il = 0; il < n_layer; ++il) {
++                const auto & l = model.layers[il];
++                ggml_megakernel_layer & w = d->layers[il];
++                const bool swa = hparams.is_swa(il);
++                if (swa) { d->rope_base_swa = model.get_rope_freq_base(cparams, il); }
++                else     { d->rope_base_full = model.get_rope_freq_base(cparams, il); }
++                w.attn_norm = l.attn_norm; w.attn_q_norm = l.attn_q_norm; w.attn_k_norm = l.attn_k_norm;
++                w.attn_post_norm = l.attn_post_norm; w.ffn_norm = l.ffn_norm; w.ffn_post_norm_1 = l.ffn_post_norm_1;
++                w.ffn_pre_norm_2 = l.ffn_pre_norm_2; w.ffn_post_norm_2 = l.ffn_post_norm_2; w.ffn_post_norm = l.ffn_post_norm;
++                w.out_scale = l.out_scale; w.rope_freqs = swa ? nullptr : l.rope_freqs;
++                w.wq = l.wq; w.wk = l.wk; w.wv = l.wv; w.wo = l.wo;
++                w.ffn_gate = l.ffn_gate; w.ffn_up = l.ffn_up; w.ffn_down = l.ffn_down;
++                w.ffn_gate_inp = l.ffn_gate_inp; w.ffn_gate_inp_s = l.ffn_gate_inp_s;
++                w.ffn_gate_up_exps = l.ffn_gate_up_exps; w.ffn_down_exps = l.ffn_down_exps; w.ffn_down_exps_s = l.ffn_down_exps_s;
++                const auto * kv = swa ? mctx_cur->get_swa() : mctx_cur->get_base();
++                ggml_tensor * k = kv->get_k(ctx0, il);
++                ggml_tensor * v = kv->get_v(ctx0, il);
++                w.k_cache = k->view_src ? k->view_src : k;
++                w.v_cache = v->view_src ? v->view_src : v;
++                w.swa = swa; w.head_dim = (int32_t) hparams.n_embd_head_k(il); w.n_head_kv = (int32_t) hparams.n_head_kv(il);
++            }
++        }
++        d = slot.get();
++    }
++
++    ggml_tensor * args[] = {
++        tokens, inp_pos,
++        inp_attn->get_kq_mask(), inp_attn->get_kq_mask_swa(),
++        inp_attn->get_k_idxs(), inp_attn->get_k_idxs_swa(),
++        inp_attn->get_v_idxs(), inp_attn->get_v_idxs_swa(),   // unused by the kernel; kept so the inputs are allocated
++        model.output_norm,   // a GPU weight: ggml's scheduler runs a node on the backend that holds its weights
++    };
++    ggml_tensor * cur = ggml_custom_4d(ctx0, GGML_TYPE_F32, d->n_vocab, 1, 1, 1, args, 9, gemma4_megakernel_cpu, 1, d);
++    cb(cur, "result_output", -1);
++    res->t_logits = cur;
++    ggml_build_forward_expand(gf, cur);
++    return true;
++}
+diff --git a/src/models/models.h b/src/models/models.h
+index d6ddf9d..685c3e5 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -879,6 +879,9 @@ struct llama_model_gemma4 : public llama_model_base {
+ 
+         graph(const llama_model & model, const llm_graph_params & params);
+ 
++        // GGML_CUDA_MEGAKERNEL=1: the decode step as one custom op (false: not applicable)
++        bool build_megakernel();
++
+         // TODO: refactor in common "per-layer" functionality [TAG_PER_LAYER]
+         ggml_tensor * build_inp_per_layer();
+         ggml_tensor * project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer);

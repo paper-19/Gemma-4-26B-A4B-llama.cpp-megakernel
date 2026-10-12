@@ -1,0 +1,11 @@
+<|turn>system
+You are a concise assistant for a hardware store.<turn|>
+<|turn>user
+Do you sell cordless drills?<turn|>
+<|turn>model
+Yes. We stock 12V and 18V cordless drills from several brands.<turn|>
+<|turn>user
+Which one would you suggest for hanging shelves on brick walls, and why?<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

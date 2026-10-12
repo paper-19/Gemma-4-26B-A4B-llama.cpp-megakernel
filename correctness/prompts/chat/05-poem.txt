@@ -1,0 +1,5 @@
+<|turn>user
+Write a short poem about a lighthouse keeper who has never seen the sea in daylight.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

@@ -1,0 +1,6 @@
+<|turn>system
+<|think|>
+<turn|>
+<|turn>user
+Three boxes are labelled apples, oranges and mixed, and every label is wrong. You may take one fruit from one box. Which box do you pick from, and how do you relabel them?<turn|>
+<|turn>model

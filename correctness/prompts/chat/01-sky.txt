@@ -1,0 +1,5 @@
+<|turn>user
+Explain why the sky is blue in three sentences.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

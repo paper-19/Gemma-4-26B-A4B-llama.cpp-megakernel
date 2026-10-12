@@ -1,0 +1,5 @@
+<|turn>user
+Return only a JSON object with the keys name, year and reason, describing the first person to walk on the Moon.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>

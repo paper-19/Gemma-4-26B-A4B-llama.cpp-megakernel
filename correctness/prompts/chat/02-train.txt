@@ -1,0 +1,5 @@
+<|turn>user
+A train leaves at 3:40 pm and travels 210 km at 84 km/h. When does it arrive? Show your steps.<turn|>
+<|turn>model
+<|channel>thought
+<channel|>
